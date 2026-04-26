@@ -1,5 +1,7 @@
 import { database } from '../db/database.js';
 import { ParsedIntent, Task, TeamMember } from './models.js';
+import { CronManager } from '../managers/cron-manager.js';
+import cron from 'node-cron';
 
 interface TaskResponse {
   message: string;
@@ -7,6 +9,8 @@ interface TaskResponse {
 }
 
 export class TaskManager {
+  constructor(private cronManager?: CronManager) {}
+
   handleIntent(
     intent: ParsedIntent,
     projectId: string,
@@ -14,17 +18,23 @@ export class TaskManager {
     mentions: string[]
   ): TaskResponse | null {
     if (intent.intent === 'GENERAL_CHAT') return null;
-    if (intent.confidence < 0.7 && intent.intent !== 'QUERY_STATUS') return null;
+    if (intent.confidence < 0.7 && !['QUERY_STATUS', 'SHOW_HELP', 'CREATE_CRON'].includes(intent.intent)) return null;
 
     switch (intent.intent) {
       case 'CREATE_TASK':
         return this.createTask(intent, projectId, sender);
+
+      case 'CREATE_CRON' as any:
+        return this.createCron(intent, projectId, sender);
 
       case 'UPDATE_STATUS':
         return this.updateStatus(intent, projectId, sender);
 
       case 'QUERY_STATUS':
         return this.queryStatus(projectId, sender);
+
+      case 'SHOW_HELP' as any:
+        return this.showHelp();
 
       case 'ASSIGN_TASK':
         return this.assignTask(intent, projectId, sender);
@@ -44,9 +54,14 @@ export class TaskManager {
   }
 
   private createTask(intent: ParsedIntent, projectId: string, sender: TeamMember): TaskResponse {
-    const assignee = intent.task?.assigneePhone
+    let assignee = intent.task?.assigneePhone
       ? database.findMemberByPhone(intent.task.assigneePhone)
       : undefined;
+
+    // Fallback to name lookup if phone failed
+    if (!assignee && intent.task?.assigneePhone) {
+      assignee = database.findMemberByName(intent.task.assigneePhone, projectId);
+    }
 
     const task = database.createTask({
       projectId,
@@ -73,6 +88,46 @@ export class TaskManager {
       ].filter(Boolean).join('\n'),
       task,
     };
+  }
+
+  private createCron(intent: ParsedIntent, projectId: string, sender: TeamMember): TaskResponse {
+    if (!this.cronManager) return { message: '❌ Cron management is not initialized.' };
+    if (!intent.cron?.schedule || !intent.cron.message) {
+      return { message: '❓ I couldn\'t understand the schedule or the message for the reminder.' };
+    }
+
+    try {
+      // If it's natural language, we might need a better parser, 
+      // but for now let's try to see if it's already a valid cron string
+      let schedule = intent.cron.schedule;
+      if (!cron.validate(schedule)) {
+        // Fallback: If it's something like "every day at 10am", we could parse it,
+        // but let's assume the LLM tries its best to output a cron string.
+        return { message: `❌ Invalid schedule format: \`${schedule}\`. Please use cron format or be more specific.` };
+      }
+
+      const job = this.cronManager.addJob({
+        name: intent.cron.name || 'Custom Reminder',
+        schedule: schedule,
+        actionType: 'custom_message',
+        actionConfig: { projectId },
+        messageTemplate: intent.cron.message,
+        targetGroupId: projectId, // Project ID is the group ID in this setup
+        enabled: true,
+      });
+
+      return {
+        message: [
+          `⏰ *Cron Job #${job.display_id} Created*`,
+          `━━━━━━━━━━━━━━━━━`,
+          `📝 Name: ${job.name}`,
+          `📅 Schedule: \`${job.schedule}\``,
+          `💬 Message: ${job.message_template}`,
+        ].join('\n'),
+      };
+    } catch (error: any) {
+      return { message: `❌ Failed to create cron job: ${error.message}` };
+    }
   }
 
   private updateStatus(intent: ParsedIntent, projectId: string, sender: TeamMember): TaskResponse {
@@ -130,15 +185,76 @@ export class TaskManager {
     for (const [status, items] of Object.entries(statusGroups)) {
       msg += `\n${emoji[status] || '📋'} *${status.toUpperCase()}* (${items.length})\n`;
       for (const t of items.slice(0, 5)) {
-        const assignee = t.assignedTo
-          ? database.findMemberByPhone(t.assignedTo)?.name || 'Unassigned'
+        // assignedTo is a member UUID, look up by ID not phone
+        const assigneeName = t.assignedTo
+          ? database.findMemberById(t.assignedTo)?.name || 'Unassigned'
           : 'Unassigned';
-        msg += `  #${t.displayId} ${t.title} → ${assignee}\n`;
+        msg += `  #${t.displayId} ${t.title} → ${assigneeName}\n`;
       }
       if (items.length > 5) msg += `  ... and ${items.length - 5} more\n`;
     }
 
     return { message: msg };
+  }
+
+  showHelp(section?: string): TaskResponse {
+    if (section === 'skills') {
+      return {
+        message: [
+          `🎯 *Skill Commands*`,
+          `━━━━━━━━━━━━━━━━━`,
+          `\`!skill list\` — List all skills`,
+          `\`!skill add <name>\` — Create a new skill`,
+          `\`!skill info <name>\` — View skill details`,
+          `\`!skill edit <name> trigger <keywords>\` — Edit triggers`,
+          `\`!skill disable <name>\` — Disable a skill`,
+          `\`!skill enable <name>\` — Re-enable a skill`,
+          `\`!skill delete <name>\` — Remove a skill`,
+        ].join('\n'),
+      };
+    }
+
+    if (section === 'cron') {
+      return {
+        message: [
+          `⏰ *Cron Commands*`,
+          `━━━━━━━━━━━━━━━━━`,
+          `\`!cron list\` — List all scheduled jobs`,
+          `\`!cron add <schedule> <action>\` — Add a job`,
+          `\`!cron pause <id>\` — Pause a job`,
+          `\`!cron resume <id>\` — Resume a job`,
+          `\`!cron run <id>\` — Run a job now`,
+          `\`!cron delete <id>\` — Remove a job`,
+        ].join('\n'),
+      };
+    }
+
+    return {
+      message: [
+        `🤖 *${process.env.BOT_NAME || 'TaskBot'} — Help*`,
+        `━━━━━━━━━━━━━━━━━`,
+        ``,
+        `📋 *Task Commands:*`,
+        `\`!task <title>\` — Create a task`,
+        `\`!task <title> @person by <date>\` — Create + assign + deadline`,
+        `\`!done <id>\` — Mark task as done`,
+        `\`!status\` — Show all tasks`,
+        `\`!my\` — Show my tasks`,
+        `\`!assign <id> @person\` — Reassign task`,
+        `\`!edit <id> title <text>\` — Edit task title`,
+        `\`!edit <id> priority <level>\` — Edit priority`,
+        `\`!edit <id> desc <text>\` — Edit description`,
+        `\`!block <id> <reason>\` — Mark as blocked`,
+        `\`!reopen <id>\` — Reopen a task`,
+        `\`!delete <id>\` — Delete a task (admin)`,
+        ``,
+        `📚 *More help:*`,
+        `\`!help skills\` — Skill management commands`,
+        `\`!help cron\` — Cron job commands`,
+        ``,
+        `💡 You can also chat naturally and I'll try to track tasks automatically!`,
+      ].join('\n'),
+    };
   }
 
   private assignTask(intent: ParsedIntent, projectId: string, sender: TeamMember): TaskResponse {

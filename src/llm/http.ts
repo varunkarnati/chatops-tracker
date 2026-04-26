@@ -2,12 +2,14 @@ export async function parseJsonResponse(response: Response, providerName: string
   const raw = await response.text();
 
   if (!response.ok) {
+    console.error(`[${providerName}] HTTP ${response.status} response:`, truncate(raw, 800));
     throw new Error(`${providerName} request failed (${response.status}): ${truncate(raw, 600)}`);
   }
 
   try {
     return JSON.parse(raw);
   } catch {
+    console.error(`[${providerName}] Non-JSON response body:`, truncate(raw, 800));
     throw new Error(`${providerName} returned non-JSON response: ${truncate(raw, 600)}`);
   }
 }

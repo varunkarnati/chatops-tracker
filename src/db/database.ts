@@ -98,6 +98,41 @@ db.exec(`
   );
 `);
 
+// ============================================================
+// Row mappers: SQLite returns snake_case, our interfaces use camelCase
+// ============================================================
+
+function mapTask(row: any): Task | undefined {
+  if (!row) return undefined;
+  return {
+    id: row.id,
+    displayId: row.display_id,
+    projectId: row.project_id,
+    title: row.title,
+    description: row.description || undefined,
+    status: row.status,
+    priority: row.priority,
+    assignedTo: row.assigned_to || undefined,
+    createdBy: row.created_by || undefined,
+    deadline: row.deadline || undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    sourceMessageId: row.source_message_id || undefined,
+  };
+}
+
+function mapMember(row: any): TeamMember | undefined {
+  if (!row) return undefined;
+  return {
+    id: row.id,
+    name: row.name,
+    phoneNumber: row.phone_number,
+    whatsappId: row.whatsapp_id,
+    projectId: row.project_id,
+    role: row.role,
+  };
+}
+
 export const database = {
   // --- Projects ---
   getOrCreateProject(groupId: string, groupName: string): string {
@@ -116,30 +151,46 @@ export const database = {
 
   // --- Team Members ---
   getOrCreateMember(phone: string, name: string, projectId: string): TeamMember {
-    let member = db.prepare(
+    const existing = db.prepare(
       'SELECT * FROM team_members WHERE phone_number = ?'
-    ).get(phone) as TeamMember | undefined;
+    ).get(phone);
 
-    if (!member) {
-      const id = randomUUID();
-      db.prepare(
-        'INSERT INTO team_members (id, name, phone_number, whatsapp_id, project_id) VALUES (?, ?, ?, ?, ?)'
-      ).run(id, name, phone, phone, projectId);
-      member = db.prepare('SELECT * FROM team_members WHERE id = ?').get(id) as TeamMember;
-    }
-    return member;
+    if (existing) return mapMember(existing)!;
+
+    const id = randomUUID();
+    db.prepare(
+      'INSERT INTO team_members (id, name, phone_number, whatsapp_id, project_id) VALUES (?, ?, ?, ?, ?)'
+    ).run(id, name, phone, phone, projectId);
+    const row = db.prepare('SELECT * FROM team_members WHERE id = ?').get(id);
+    return mapMember(row)!;
   },
 
   findMemberByPhone(phone: string): TeamMember | undefined {
-    return db.prepare(
+    const row = db.prepare(
       'SELECT * FROM team_members WHERE phone_number = ? OR whatsapp_id = ?'
-    ).get(phone, phone) as TeamMember | undefined;
+    ).get(phone, phone);
+    return mapMember(row);
+  },
+
+  findMemberByName(name: string, projectId: string): TeamMember | undefined {
+    const row = db.prepare(
+      'SELECT * FROM team_members WHERE LOWER(name) = ? AND project_id = ?'
+    ).get(name.toLowerCase(), projectId);
+    return mapMember(row);
+  },
+
+  findMemberById(id: string): TeamMember | undefined {
+    const row = db.prepare(
+      'SELECT * FROM team_members WHERE id = ?'
+    ).get(id);
+    return mapMember(row);
   },
 
   getTeamMembers(projectId: string): TeamMember[] {
-    return db.prepare(
+    const rows = db.prepare(
       'SELECT * FROM team_members WHERE project_id = ? ORDER BY joined_at ASC'
-    ).all(projectId) as TeamMember[];
+    ).all(projectId);
+    return rows.map(r => mapMember(r)!);
   },
 
   // --- Tasks ---
@@ -160,19 +211,21 @@ export const database = {
       task.sourceMessageId || null
     );
 
-    return db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as Task;
+    return mapTask(db.prepare('SELECT * FROM tasks WHERE id = ?').get(id))!;
   },
 
   getTaskByDisplayId(displayId: number, projectId: string): Task | undefined {
-    return db.prepare(
+    const row = db.prepare(
       'SELECT * FROM tasks WHERE display_id = ? AND project_id = ?'
-    ).get(displayId, projectId) as Task | undefined;
+    ).get(displayId, projectId);
+    return mapTask(row);
   },
 
   updateTaskStatus(displayId: number, projectId: string, status: string, changedBy?: string): Task | null {
-    const task = db.prepare(
+    const row = db.prepare(
       'SELECT * FROM tasks WHERE display_id = ? AND project_id = ?'
-    ).get(displayId, projectId) as Task | undefined;
+    ).get(displayId, projectId);
+    const task = mapTask(row);
 
     if (!task) return null;
 
@@ -185,13 +238,14 @@ export const database = {
       ).run(randomUUID(), task.id, changedBy, 'status', task.status, status);
     }
 
-    return db.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id) as Task;
+    return mapTask(db.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id))!;
   },
 
   updateTaskField(displayId: number, projectId: string, field: string, value: string, changedBy?: string): Task | null {
-    const task = db.prepare(
+    const row = db.prepare(
       'SELECT * FROM tasks WHERE display_id = ? AND project_id = ?'
-    ).get(displayId, projectId) as Task | undefined;
+    ).get(displayId, projectId);
+    const task = mapTask(row);
 
     if (!task) return null;
 
@@ -208,7 +262,7 @@ export const database = {
       ).run(randomUUID(), task.id, changedBy, field, oldValue, value);
     }
 
-    return db.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id) as Task;
+    return mapTask(db.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id))!;
   },
 
   deleteTask(taskId: string): void {
@@ -218,32 +272,38 @@ export const database = {
   },
 
   findTaskByTitle(projectId: string, titleFragment: string): Task | undefined {
-    return db.prepare(
+    const row = db.prepare(
       "SELECT * FROM tasks WHERE project_id = ? AND LOWER(title) LIKE ? AND status != 'done' ORDER BY created_at DESC LIMIT 1"
-    ).get(projectId, `%${titleFragment.toLowerCase()}%`) as Task | undefined;
+    ).get(projectId, `%${titleFragment.toLowerCase()}%`);
+    return mapTask(row);
   },
 
   getTasksByProject(projectId: string, status?: string): Task[] {
+    let rows;
     if (status) {
-      return db.prepare(
+      rows = db.prepare(
         'SELECT * FROM tasks WHERE project_id = ? AND status = ? ORDER BY priority DESC, deadline ASC'
-      ).all(projectId, status) as Task[];
+      ).all(projectId, status);
+    } else {
+      rows = db.prepare(
+        "SELECT * FROM tasks WHERE project_id = ? AND status != 'done' ORDER BY priority DESC, deadline ASC"
+      ).all(projectId);
     }
-    return db.prepare(
-      "SELECT * FROM tasks WHERE project_id = ? AND status != 'done' ORDER BY priority DESC, deadline ASC"
-    ).all(projectId) as Task[];
+    return rows.map(r => mapTask(r)!);
   },
 
   getTasksByAssignee(memberId: string): Task[] {
-    return db.prepare(
+    const rows = db.prepare(
       "SELECT * FROM tasks WHERE assigned_to = ? AND status != 'done' ORDER BY deadline ASC"
-    ).all(memberId) as Task[];
+    ).all(memberId);
+    return rows.map(r => mapTask(r)!);
   },
 
   getOverdueTasks(projectId: string): Task[] {
-    return db.prepare(
+    const rows = db.prepare(
       "SELECT * FROM tasks WHERE project_id = ? AND deadline < datetime('now') AND status NOT IN ('done', 'blocked') ORDER BY deadline ASC"
-    ).all(projectId) as Task[];
+    ).all(projectId);
+    return rows.map(r => mapTask(r)!);
   },
 
   // --- Skills ---

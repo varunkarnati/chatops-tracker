@@ -20,6 +20,9 @@ const ALLOWED_INTENTS = new Set<ParsedIntent['intent']>([
   'BLOCK_TASK',
   'EDIT_TASK',
   'DELETE_TASK',
+  'SHOW_HELP',
+  'CREATE_CRON',
+  'DELETE_CRON',
   'GENERAL_CHAT',
 ]);
 
@@ -40,35 +43,32 @@ export async function parseLLM(
 
   const defaultSystemPrompt = `You are a task-tracking assistant analyzing WhatsApp group messages for a software team.
 
-Your job: classify each message and extract structured task data.
+Your job: classify each message and extract structured task or cron data.
+IMPORTANT: Output ONLY the JSON object. No explanation, no reasoning, no markdown fences.
 
 RULES:
-1. Be CONSERVATIVE. Only classify as a task-related intent if the message clearly indicates work to be done.
-2. Casual conversation, greetings, jokes, reactions -> GENERAL_CHAT.
-3. If someone mentions doing something or asks someone to do something -> likely a task.
-4. If someone says something is "done", "completed", or "finished" -> UPDATE_STATUS.
-5. Extract deadlines from natural language ("by Friday", "tomorrow", "next week").
-6. @mentions indicate task assignment.
-7. Respond with valid JSON only, no markdown.
+1. One-off work items (e.g. "Fix the login bug", "I'll do the docs") -> CREATE_TASK.
+2. Recurring events, scheduled reminders, or messages with a specific frequency (e.g. "Every day at...", "Remind us at 11pm", "Standup at 10am daily") -> CREATE_CRON.
+3. If it has a frequency or recurring time, it is ALWAYS a CRON job, NOT a task.
+4. For CREATE_CRON, always provide a "schedule" (cron format or natural time) and a "message".
 
-Respond with this exact JSON shape:
+JSON schema:
 {
-  "intent": "CREATE_TASK" | "UPDATE_STATUS" | "ASSIGN_TASK" | "SET_DEADLINE" | "QUERY_STATUS" | "ADD_COMMENT" | "SET_PRIORITY" | "BLOCK_TASK" | "EDIT_TASK" | "DELETE_TASK" | "GENERAL_CHAT",
+  "intent": "CREATE_TASK|UPDATE_STATUS|ASSIGN_TASK|SET_DEADLINE|QUERY_STATUS|ADD_COMMENT|SET_PRIORITY|BLOCK_TASK|EDIT_TASK|DELETE_TASK|CREATE_CRON|DELETE_CRON|GENERAL_CHAT",
   "task": {
-    "title": "short task title",
-    "assigneePhone": "mentioned phone or null",
-    "deadline": "ISO-8601 date string or natural language",
-    "status": "todo|in_progress|review|done|blocked or null",
-    "priority": "low|medium|high|critical or null",
-    "relatedTaskId": "task number or null",
-    "blockReason": "reason or null",
-    "editField": "title|desc|priority|deadline|status or null",
-    "editValue": "new value for edit or null"
+    "title": "string|null",
+    "assigneePhone": "use phone from mentions or null",
+    "deadline": "string|null"
   },
-  "confidence": 0.0 to 1.0
+  "cron": {
+    "name": "short name for reminder",
+    "schedule": "cron format (e.g. '22 23 * * *' for 11:22 PM) or natural time",
+    "message": "message to send when triggered"
+  },
+  "confidence": 0.0
 }
 
-Today's date: ${new Date().toISOString().split('T')[0]}`;
+Today: ${new Date().toISOString().split('T')[0]}`;
 
   try {
     const llm = getProvider();
@@ -77,11 +77,16 @@ Today's date: ${new Date().toISOString().split('T')[0]}`;
       systemPrompt: systemPromptOverride || defaultSystemPrompt,
       userPrompt: `Sender: ${senderName}\nMentions: ${mentions.join(', ') || 'none'}\nMessage: "${text}"`,
       temperature: 0.1,
-      maxTokens: 400,
+      maxTokens: 2048,
     });
 
+    console.log(`🤖 LLM Raw Output:`, raw.substring(0, 500) + (raw.length > 500 ? '...' : ''));
+
     const parsed = JSON.parse(extractJsonPayload(raw));
-    return normalizeParsedIntent(parsed);
+    const intent = normalizeParsedIntent(parsed);
+    
+    console.log(`🎯 Parsed Intent: ${intent.intent} (${(intent.confidence * 100).toFixed(0)}%)`);
+    return intent;
   } catch (error) {
     console.error('LLM parsing error:', error);
     return { intent: 'GENERAL_CHAT', confidence: 0 };
@@ -115,15 +120,30 @@ function extractJsonPayload(raw: string): string {
 }
 
 function normalizeParsedIntent(raw: any): ParsedIntent {
-  const intent: ParsedIntent['intent'] = ALLOWED_INTENTS.has(raw?.intent) ? raw.intent : 'GENERAL_CHAT';
-  const confidence = normalizeConfidence(raw?.confidence);
+  const rawIntent = (raw?.intent || raw?.action || 'GENERAL_CHAT').toUpperCase();
+  const intent: ParsedIntent['intent'] = ALLOWED_INTENTS.has(rawIntent as any) ? (rawIntent as any) : 'GENERAL_CHAT';
+  
+  // Default to 1.0 if confidence is missing but intent is specific
+  const confidence = raw?.confidence !== undefined ? normalizeConfidence(raw.confidence) : (intent === 'GENERAL_CHAT' ? 1.0 : 1.0);
 
   const task = normalizeTask(raw?.task);
+  const cron = normalizeCron(raw?.cron);
+  
   return {
     intent,
     task: task && Object.keys(task).length > 0 ? task : undefined,
+    cron: cron && Object.keys(cron).length > 0 ? cron : undefined,
     confidence,
   };
+}
+
+function normalizeCron(raw: any): ParsedIntent['cron'] | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const cron: NonNullable<ParsedIntent['cron']> = {};
+  if (typeof raw.name === 'string') cron.name = raw.name;
+  if (typeof raw.schedule === 'string') cron.schedule = raw.schedule;
+  if (typeof raw.message === 'string') cron.message = raw.message;
+  return cron;
 }
 
 function normalizeTask(raw: any): ParsedIntent['task'] | undefined {
@@ -134,9 +154,13 @@ function normalizeTask(raw: any): ParsedIntent['task'] | undefined {
   if (typeof raw.title === 'string' && raw.title.trim()) {
     task.title = raw.title.trim();
   }
-  if (typeof raw.assigneePhone === 'string' && raw.assigneePhone.trim()) {
-    task.assigneePhone = raw.assigneePhone.trim();
+  
+  // Robust assignee lookup
+  const assignee = raw.assigneePhone || raw.assignee;
+  if (typeof assignee === 'string' && assignee.trim()) {
+    task.assigneePhone = assignee.trim();
   }
+
   if (typeof raw.deadline === 'string' && raw.deadline.trim()) {
     task.deadline = raw.deadline.trim();
   }

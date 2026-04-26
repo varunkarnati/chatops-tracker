@@ -39,6 +39,9 @@ export interface ParsedIntent {
     | 'BLOCK_TASK'
     | 'EDIT_TASK'
     | 'DELETE_TASK'
+    | 'SHOW_HELP'
+    | 'CREATE_CRON'
+    | 'DELETE_CRON'
     | 'GENERAL_CHAT';
   task?: {
     title?: string;
@@ -50,6 +53,11 @@ export interface ParsedIntent {
     blockReason?: string;
     editField?: string;
     editValue?: string;
+  };
+  cron?: {
+    name?: string;
+    schedule?: string;
+    message?: string;
   };
   confidence: number;
 }

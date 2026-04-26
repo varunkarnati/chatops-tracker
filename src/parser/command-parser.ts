@@ -16,6 +16,12 @@ export function parseCommand(text: string, mentions: string[]): ParsedIntent | n
     case 'task': {
       // !task Design login page @+1234567890 by Friday
       const rest = parts.slice(1).join(' ');
+      if (!rest) {
+        return {
+          intent: 'SHOW_HELP' as any,
+          confidence: 1.0,
+        };
+      }
       const byMatch = rest.match(/\bby\s+(.+)$/i);
       const deadline = byMatch?.[1] || undefined;
       const title = rest
@@ -36,7 +42,13 @@ export function parseCommand(text: string, mentions: string[]): ParsedIntent | n
 
     case 'done': {
       const taskId = parseInt(parts[1]);
-      if (isNaN(taskId)) return null;
+      if (isNaN(taskId)) {
+        // !done without an ID — show usage hint
+        return {
+          intent: 'SHOW_HELP' as any,
+          confidence: 1.0,
+        };
+      }
       return {
         intent: 'UPDATE_STATUS',
         task: { relatedTaskId: taskId, status: 'done' as TaskStatus },
@@ -141,8 +153,11 @@ export function parseCommand(text: string, mentions: string[]): ParsedIntent | n
 
     case 'help': {
       const subcommand = parts[1]?.toLowerCase();
-      // Return QUERY_STATUS with metadata for different help sections
-      return { intent: 'QUERY_STATUS', confidence: 1.0 };
+      return {
+        intent: 'SHOW_HELP' as any,
+        task: subcommand ? { title: subcommand } : undefined,
+        confidence: 1.0,
+      };
     }
 
     // --- Skill Management ---

@@ -85,7 +85,7 @@ export class ContextAssembler {
     for (const [status, items] of Object.entries(byStatus)) {
       snapshot += `### ${status.toUpperCase()} (${items.length})\n`;
       for (const t of items.slice(0, 10)) {
-        const assignee = t.assignedTo ? (database.findMemberByPhone(t.assignedTo)?.name || 'Unassigned') : 'Unassigned';
+        const assignee = t.assignedTo ? (database.findMemberById(t.assignedTo)?.name || 'Unassigned') : 'Unassigned';
         snapshot += `- #${t.displayId} "${t.title}" → ${assignee}`;
         if (t.deadline) snapshot += ` (due: ${t.deadline})`;
         snapshot += `\n`;

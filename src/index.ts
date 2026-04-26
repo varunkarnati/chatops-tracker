@@ -21,10 +21,10 @@ async function main() {
 
   // --- Initialize core components ---
   const adapter = new WhatsAppAdapter();
-  const taskManager = new TaskManager();
   const contextAssembler = new ContextAssembler(config.workspacePath);
   const skillManager = new SkillManager(contextAssembler.skillRegistry);
   const cronManager = new CronManager(adapter);
+  const taskManager = new TaskManager(cronManager);
   const _hotReloader = new HotReloader(contextAssembler.skillRegistry, config.workspacePath);
 
   // --- Initialize dashboard ---
@@ -35,6 +35,8 @@ async function main() {
   // --- Message handler ---
   adapter.onMessage(async (msg) => {
     try {
+      console.log(`📨 [${msg.senderName}]: ${msg.text}`);
+
       // 1. Ensure project exists for this group
       if (!projectGroups.has(msg.groupId)) {
         const projectId = database.getOrCreateProject(msg.groupId, msg.groupName);
@@ -52,20 +54,30 @@ async function main() {
       // 3. Try command-based parsing first (explicit commands are instant + free)
       let intent = parseCommand(msg.text, msg.mentions);
 
-      // 4. If no command matched, try LLM-based parsing with full context
+      // 4. Handle SHOW_HELP separately (it goes through TaskManager.showHelp directly)
+      if (intent && intent.intent === 'SHOW_HELP') {
+        const helpSection = intent.task?.title; // 'skills', 'cron', or undefined
+        const response = taskManager.showHelp(helpSection);
+        await adapter.sendToGroup(msg.groupId, response.message);
+        return;
+      }
+
+      // 5. If no command matched, try LLM-based parsing with full context
       if (!intent) {
+        console.log(`🤔 Thinking... (LLM)`);
         const assembledPrompt = contextAssembler.assemblePrompt(msg, projectId);
         intent = await parseLLM(msg.text, msg.senderName, msg.mentions, assembledPrompt);
       }
 
-      // 5. Handle the parsed intent
+      // 6. Handle the parsed intent
       const response = taskManager.handleIntent(intent, projectId, sender, msg.mentions);
 
-      // 6. Send response back to the group
+      // 7. Send response back to the group
       if (response) {
+        console.log(`📤 Bot reply: ${response.message.substring(0, 80)}...`);
         await adapter.sendToGroup(msg.groupId, response.message);
 
-        // 7. Broadcast to dashboard clients
+        // 8. Broadcast to dashboard clients
         if (response.task) {
           dashboard.sync.broadcastToProject(projectId, 'task:updated', response.task);
         }
