@@ -30,10 +30,20 @@ export class DashboardServer {
     this.setupRoutes();
   }
 
+  public onWebhook?: (payload: any) => void;
+
   private setupRoutes() {
     const authMiddleware = createAuthMiddleware(this.auth);
 
     // --- Public Routes ---
+    this.app.post('/api/webhooks/inbound', (req, res) => {
+      console.log('🔔 Received inbound webhook payload');
+      if (this.onWebhook) {
+        this.onWebhook(req.body).catch(err => console.error('Webhook error:', err));
+      }
+      res.json({ success: true, message: 'Webhook received and processing' });
+    });
+
     this.app.get('/api/public/tasks', (req, res) => {
       const projects = database.getProjects();
       if (projects.length === 0) return res.json([]);

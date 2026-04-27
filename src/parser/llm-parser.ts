@@ -23,6 +23,7 @@ const ALLOWED_INTENTS = new Set<ParsedIntent['intent']>([
   'CREATE_CRON',
   'DELETE_CRON',
   'DASHBOARD_CHART',
+  'EXECUTE_CODE',
   'GENERAL_CHAT',
 ]);
 
@@ -93,10 +94,11 @@ RULES:
 6. When a user replies to a task confirmation message, interpret it as an update to that task, NOT a new task.
 7. For UPDATE_STATUS, always include "relatedTaskId" as a number.
 8. If the user refers to a task by name (e.g., "move the login task to testing") without the ID, YOU MUST FIND the task in the 'Current Board State' snapshot, extract its #ID, and output it as "relatedTaskId".
+9. For EXECUTE_CODE, the code snippet MUST be a valid JSON string. You MUST escape all newlines as \\n, double quotes as \\", and backslashes as \\\\.
 
 JSON schema:
 {
-  "intent": "CREATE_TASK|UPDATE_STATUS|ASSIGN_TASK|SET_DEADLINE|QUERY_STATUS|ADD_COMMENT|SET_PRIORITY|EDIT_TASK|DELETE_TASK|CREATE_CRON|DELETE_CRON|GENERAL_CHAT",
+  "intent": "CREATE_TASK|UPDATE_STATUS|ASSIGN_TASK|SET_DEADLINE|QUERY_STATUS|ADD_COMMENT|SET_PRIORITY|EDIT_TASK|DELETE_TASK|CREATE_CRON|DELETE_CRON|EXECUTE_CODE|GENERAL_CHAT",
   "task": {
     "title": "string|null",
     "assigneePhone": "use phone from mentions or null",
@@ -109,6 +111,10 @@ JSON schema:
     "name": "short name for reminder",
     "schedule": "5-field cron format ONLY (e.g. '0 22 * * *' for 10 PM daily)",
     "message": "message to send when triggered"
+  },
+  "code": {
+    "language": "python|javascript|bash",
+    "snippet": "properly escaped code string here"
   },
   "confidence": 0.0
 }
@@ -134,7 +140,32 @@ Today: ${new Date().toISOString().split('T')[0]}`;
 
     console.log(`🤖 LLM Raw Output:`, raw.substring(0, 500) + (raw.length > 500 ? '...' : ''));
 
-    const parsed = JSON.parse(extractJsonPayload(raw));
+    let jsonStr = extractJsonPayload(raw);
+    let parsed;
+    try {
+      parsed = JSON.parse(jsonStr);
+    } catch (e) {
+      console.warn('⚠️ JSON parse failed, attempting strict regex fallback extraction for code snippet');
+      // If parsing fails (usually due to unescaped code), fallback to manual extraction
+      const intentMatch = jsonStr.match(/"intent"\s*:\s*"([^"]+)"/);
+      const langMatch = jsonStr.match(/"language"\s*:\s*"([^"]+)"/);
+      // Extract everything between "snippet": " and the final "
+      const snippetMatch = jsonStr.match(/"snippet"\s*:\s*"([\s\S]*?)"\s*\}/);
+      
+      if (intentMatch && intentMatch[1] === 'EXECUTE_CODE' && snippetMatch) {
+        parsed = {
+          intent: 'EXECUTE_CODE',
+          code: {
+            language: langMatch ? langMatch[1] : 'javascript',
+            snippet: snippetMatch[1].replace(/\\\\/g, '\\').replace(/\\"/g, '"')
+          },
+          confidence: 1.0
+        };
+      } else {
+        throw e;
+      }
+    }
+    
     const intent = normalizeParsedIntent(parsed);
     
     console.log(`🎯 Parsed Intent: ${intent.intent} (${(intent.confidence * 100).toFixed(0)}%)`);
@@ -253,13 +284,35 @@ function normalizeParsedIntent(raw: any): ParsedIntent {
 
   const task = normalizeTask(raw?.task);
   const cron = normalizeCron(raw?.cron);
+  const code = normalizeCode(raw?.code);
   
   return {
     intent,
     task: task && Object.keys(task).length > 0 ? task : undefined,
     cron: cron && Object.keys(cron).length > 0 ? cron : undefined,
+    code: code && Object.keys(code).length > 0 ? code : undefined,
     confidence,
   };
+}
+
+function normalizeCode(raw: any): ParsedIntent['code'] | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const code: NonNullable<ParsedIntent['code']> = {};
+  
+  if (typeof raw.language === 'string') {
+    let lang = raw.language.toLowerCase();
+    if (['node', 'node.js', 'nodejs', 'js', 'javascript'].includes(lang)) {
+      lang = 'javascript';
+    } else if (['py', 'python3', 'python'].includes(lang)) {
+      lang = 'python';
+    } else if (['sh', 'shell', 'bash'].includes(lang)) {
+      lang = 'bash';
+    }
+    code.language = lang as any;
+  }
+  
+  if (typeof raw.snippet === 'string') code.snippet = raw.snippet;
+  return code;
 }
 
 function normalizeCron(raw: any): ParsedIntent['cron'] | undefined {
