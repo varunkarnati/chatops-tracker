@@ -40,8 +40,8 @@ async function main() {
     cronManager.loadAll(projectId);
   }
 
-  // --- Message handler ---
-  adapter.onMessage(async (msg) => {
+  // --- Message Processing Logic ---
+  const processMessage = async (msg: any) => {
     try {
       console.log(`📨 [${msg.senderName}]: ${msg.text}`);
 
@@ -150,7 +150,7 @@ async function main() {
       }
 
       // 10. Handle the parsed intent
-      const response = taskManager.handleIntent(intent, projectId, sender, msg.mentions, msg.groupId);
+      const response = await taskManager.handleIntent(intent, projectId, sender, msg.mentions, msg.groupId);
 
       // 11. Send response back to the group
       if (response) {
@@ -179,7 +179,36 @@ async function main() {
     } catch (error) {
       console.error('Error processing message:', error);
     }
-  });
+  };
+
+  // Listen to WhatsApp
+  adapter.onMessage(processMessage);
+
+  // Listen to Webhooks from Dashboard
+  dashboard.onWebhook = async (payload) => {
+    const projects = database.getProjects();
+    if (projects.length === 0) {
+      console.log('⚠️ Webhook received but no projects exist to route it to.');
+      return;
+    }
+    const targetProject = projects[0];
+    
+    // Construct a synthetic WhatsApp message from the webhook payload
+    const simulatedMsg = {
+      id: `webhook-${Date.now()}`,
+      groupId: targetProject.whatsappGroupId,
+      senderId: 'webhook@system',
+      senderName: payload.senderName || 'System Alert',
+      text: payload.text || JSON.stringify(payload),
+      mentions: [],
+      timestamp: Date.now()
+    };
+    
+    // Inject custom prefix to help LLM understand it's an external alert
+    simulatedMsg.text = `[EXTERNAL WEBHOOK ALERT]\n${simulatedMsg.text}\nPlease log this appropriately.`;
+    
+    await processMessage(simulatedMsg);
+  };
 
   // --- Connect and start ---
   await adapter.connect();

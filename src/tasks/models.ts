@@ -43,6 +43,7 @@ export interface ParsedIntent {
     | 'CREATE_CRON'
     | 'DELETE_CRON'
     | 'DASHBOARD_CHART'
+    | 'EXECUTE_CODE'
     | 'GENERAL_CHAT';
   task?: {
     title?: string;
@@ -60,6 +61,10 @@ export interface ParsedIntent {
     schedule?: string;
     message?: string;
     targetGroupId?: string;
+  };
+  code?: {
+    language?: 'python' | 'javascript' | 'bash';
+    snippet?: string;
   };
   confidence: number;
 }

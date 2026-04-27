@@ -1,6 +1,7 @@
 import { database } from '../db/database.js';
 import { ParsedIntent, Task, TeamMember } from './models.js';
 import { CronManager } from '../managers/cron-manager.js';
+import { SandboxManager } from '../managers/sandbox-manager.js';
 import cron from 'node-cron';
 
 interface TaskResponse {
@@ -9,17 +10,22 @@ interface TaskResponse {
 }
 
 export class TaskManager {
-  constructor(private cronManager?: CronManager) {}
+  private sandboxManager: SandboxManager;
 
-  handleIntent(
+  constructor(private cronManager?: CronManager) {
+    this.sandboxManager = new SandboxManager();
+    this.sandboxManager.init().catch(e => console.error('Sandbox init error:', e));
+  }
+
+  async handleIntent(
     intent: ParsedIntent,
     projectId: string,
     sender: TeamMember,
     mentions: string[],
     groupId: string
-  ): TaskResponse | null {
+  ): Promise<TaskResponse | null> {
     if (intent.intent === 'GENERAL_CHAT') return null;
-    if (intent.confidence < 0.7 && !['QUERY_STATUS', 'SHOW_HELP', 'CREATE_CRON', 'DASHBOARD_CHART'].includes(intent.intent)) return null;
+    if (intent.confidence < 0.7 && !['QUERY_STATUS', 'SHOW_HELP', 'CREATE_CRON', 'DASHBOARD_CHART', 'EXECUTE_CODE'].includes(intent.intent)) return null;
 
     switch (intent.intent) {
       case 'CREATE_TASK':
@@ -30,6 +36,9 @@ export class TaskManager {
 
       case 'DASHBOARD_CHART' as any:
         return this.generateChart(projectId, groupId);
+
+      case 'EXECUTE_CODE':
+        return await this.executeCodeTask(intent);
 
       case 'UPDATE_STATUS':
         return this.updateStatus(intent, projectId, sender);
@@ -52,6 +61,18 @@ export class TaskManager {
       default:
         return null;
     }
+  }
+
+  private async executeCodeTask(intent: ParsedIntent): Promise<TaskResponse> {
+    if (!intent.code || !intent.code.snippet || !intent.code.language) {
+      return { message: '❌ Invalid code execution request. Missing language or snippet.' };
+    }
+    
+    const result = await this.sandboxManager.executeCode(intent.code.language, intent.code.snippet);
+    
+    return {
+      message: `💻 *Sandbox Execution Result* (${intent.code.language})\n━━━━━━━━━━━━━━━━━\n\`\`\`\n${result}\n\`\`\``
+    };
   }
 
   private createTask(intent: ParsedIntent, projectId: string, sender: TeamMember, mentions: string[] = []): TaskResponse {

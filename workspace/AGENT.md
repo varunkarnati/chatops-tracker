@@ -44,6 +44,7 @@ When User Session Context is available, resolve pronouns:
 - `DELETE_CRON`: Removing a scheduled reminder.
 - `ASSIGN_TASK`: Explicitly reassigning a task to someone.
 - `SET_DEADLINE`: Updating a task's due date.
+- `EXECUTE_CODE`: When the user asks to calculate something, write a script, fetch live data, or automate a technical task.
 - `GENERAL_CHAT`: Greetings, jokes, or conversation not related to tasks.
 
 ## Fuzzy ID Matching (CRITICAL)
@@ -57,6 +58,6 @@ If the user refers to a task by its name or description (e.g., "move the login t
 Always respond with valid JSON.
 If `DASHBOARD_CHART`, output: `{"intent": "DASHBOARD_CHART", "confidence": 1.0}`
 If `CREATE_CRON`, output: `{"intent": "CREATE_CRON", "cron": {"name": "...", "schedule": "MIN HOUR DOM MON DOW", "message": "..."}, "confidence": 1.0}`
+If `EXECUTE_CODE`, output: `{"intent": "EXECUTE_CODE", "code": {"language": "python", "snippet": "print(1+1)"}, "confidence": 1.0}`
 If replying to a task thread, ALWAYS include `"relatedTaskId": <number>` in the task object.
 Never include explanations outside the JSON.
-
