@@ -15,17 +15,21 @@ export class TaskManager {
     intent: ParsedIntent,
     projectId: string,
     sender: TeamMember,
-    mentions: string[]
+    mentions: string[],
+    groupId: string
   ): TaskResponse | null {
     if (intent.intent === 'GENERAL_CHAT') return null;
-    if (intent.confidence < 0.7 && !['QUERY_STATUS', 'SHOW_HELP', 'CREATE_CRON'].includes(intent.intent)) return null;
+    if (intent.confidence < 0.7 && !['QUERY_STATUS', 'SHOW_HELP', 'CREATE_CRON', 'DASHBOARD_CHART'].includes(intent.intent)) return null;
 
     switch (intent.intent) {
       case 'CREATE_TASK':
-        return this.createTask(intent, projectId, sender);
+        return this.createTask(intent, projectId, sender, mentions);
 
       case 'CREATE_CRON' as any:
-        return this.createCron(intent, projectId, sender);
+        return this.createCron(intent, projectId, sender, groupId);
+
+      case 'DASHBOARD_CHART' as any:
+        return this.generateChart(projectId, groupId);
 
       case 'UPDATE_STATUS':
         return this.updateStatus(intent, projectId, sender);
@@ -37,10 +41,7 @@ export class TaskManager {
         return this.showHelp();
 
       case 'ASSIGN_TASK':
-        return this.assignTask(intent, projectId, sender);
-
-      case 'BLOCK_TASK':
-        return this.blockTask(intent, projectId, sender);
+        return this.assignTask(intent, projectId, sender, mentions);
 
       case 'EDIT_TASK':
         return this.editTask(intent, projectId, sender);
@@ -53,14 +54,26 @@ export class TaskManager {
     }
   }
 
-  private createTask(intent: ParsedIntent, projectId: string, sender: TeamMember): TaskResponse {
+  private createTask(intent: ParsedIntent, projectId: string, sender: TeamMember, mentions: string[] = []): TaskResponse {
+    // 1. Try LLM-extracted assignee phone
     let assignee = intent.task?.assigneePhone
       ? database.findMemberByPhone(intent.task.assigneePhone)
       : undefined;
 
-    // Fallback to name lookup if phone failed
+    // 2. Fallback to name lookup
     if (!assignee && intent.task?.assigneePhone) {
       assignee = database.findMemberByName(intent.task.assigneePhone, projectId);
+    }
+
+    // 3. Fallback to WhatsApp @mentions (crucial when LLM doesn't extract the phone)
+    if (!assignee && mentions.length > 0) {
+      for (const mention of mentions) {
+        const found = database.findMemberByPhone(mention);
+        if (found) {
+          assignee = found;
+          break;
+        }
+      }
     }
 
     const task = database.createTask({
@@ -90,19 +103,15 @@ export class TaskManager {
     };
   }
 
-  private createCron(intent: ParsedIntent, projectId: string, sender: TeamMember): TaskResponse {
+  private createCron(intent: ParsedIntent, projectId: string, sender: TeamMember, groupId: string): TaskResponse {
     if (!this.cronManager) return { message: '❌ Cron management is not initialized.' };
     if (!intent.cron?.schedule || !intent.cron.message) {
       return { message: '❓ I couldn\'t understand the schedule or the message for the reminder.' };
     }
 
     try {
-      // If it's natural language, we might need a better parser, 
-      // but for now let's try to see if it's already a valid cron string
       let schedule = intent.cron.schedule;
       if (!cron.validate(schedule)) {
-        // Fallback: If it's something like "every day at 10am", we could parse it,
-        // but let's assume the LLM tries its best to output a cron string.
         return { message: `❌ Invalid schedule format: \`${schedule}\`. Please use cron format or be more specific.` };
       }
 
@@ -112,8 +121,9 @@ export class TaskManager {
         actionType: 'custom_message',
         actionConfig: { projectId },
         messageTemplate: intent.cron.message,
-        targetGroupId: projectId, // Project ID is the group ID in this setup
+        targetGroupId: groupId, // FIXED: use WhatsApp group ID, not database UUID
         enabled: true,
+        createdBy: sender.id,
       });
 
       return {
@@ -130,6 +140,100 @@ export class TaskManager {
     }
   }
 
+  private generateChart(projectId: string, groupId: string): TaskResponse {
+    const tasks = database.getTasksByProject(projectId);
+    const counts: Record<string, number> = { todo: 0, in_progress: 0, review: 0, blocked: 0, done: 0 };
+    
+    tasks.forEach(t => {
+      counts[t.status] = (counts[t.status] || 0) + 1;
+    });
+
+    // Also get done tasks from DB for the chart
+    const doneTasks = database.getTasksByProject(projectId, 'done');
+    counts.done = doneTasks.length;
+
+    const total = Object.values(counts).reduce((a, b) => a + b, 0);
+    if (total === 0) return { message: '📊 *No tasks to chart!* Add some tasks first.' };
+
+    const allTasks = [...tasks, ...doneTasks].sort((a, b) => a.displayId - b.displayId);
+    
+    if (allTasks.length === 0) return { message: '📊 *No tasks to show!*' };
+
+    const statusMap: Record<string, string> = {
+      todo: 'TO DO',
+      in_progress: 'IN PROGRESS',
+      testing: 'TESTING',
+      done: 'DONE'
+    };
+
+    const rows = allTasks.map(t => {
+      const assignee = t.assignedTo ? (database.findMemberById(t.assignedTo)?.name || 'Unassigned') : 'Unassigned';
+      return [
+        `#${t.displayId}`,
+        t.title.length > 30 ? t.title.substring(0, 27) + '...' : t.title,
+        statusMap[t.status] || t.status.toUpperCase(),
+        assignee
+      ];
+    });
+
+    // Generate Text-based Kanban Board for accessibility
+    let board = `📋 *Task Table: ${allTasks.length} items*\n━━━━━━━━━━━━━━━━━\n`;
+    
+    const categories = [
+      { key: 'todo', label: 'TO DO 📋', emoji: '⚪' },
+      { key: 'in_progress', label: 'IN PROGRESS 🔄', emoji: '🔵' },
+      { key: 'testing', label: 'TESTING 🧪', emoji: '🧪' },
+      { key: 'done', label: 'DONE ✅', emoji: '🟢' }
+    ];
+
+    for (const cat of categories) {
+      const catTasks = allTasks.filter(t => t.status === cat.key);
+      if (catTasks.length > 0) {
+        board += `\n*${cat.label}* (${catTasks.length})\n`;
+        for (const t of catTasks.slice(0, 5)) {
+          const assignee = t.assignedTo ? (database.findMemberById(t.assignedTo)?.name || 'Unassigned') : 'Unassigned';
+          board += `  ${cat.emoji} #${t.displayId} ${t.title} (@${assignee})\n`;
+        }
+      }
+    }
+    const chartConfig = {
+      type: 'doughnut',
+      data: {
+        labels: ['To Do', 'In Progress', 'Testing', 'Done'],
+        datasets: [{
+          data: [
+            allTasks.filter(t => t.status === 'todo').length,
+            allTasks.filter(t => t.status === 'in_progress').length,
+            allTasks.filter(t => t.status === 'testing').length,
+            allTasks.filter(t => t.status === 'done').length
+          ],
+          backgroundColor: ['#94a3b8', '#3b82f6', '#8b5cf6', '#22c55e']
+        }]
+      },
+      options: {
+        plugins: {
+          datalabels: {
+            display: true,
+            color: '#fff',
+            font: { weight: 'bold', size: 16 }
+          },
+          doughnutlabel: {
+            labels: [
+              { text: allTasks.length.toString(), font: { size: 40, weight: 'bold' } },
+              { text: 'Total Tasks' }
+            ]
+          }
+        }
+      }
+    };
+
+    const chartUrl = `https://quickchart.io/chart?c=${encodeURIComponent(JSON.stringify(chartConfig))}&w=500&h=300`;
+
+    return {
+      message: `${board.trimEnd()}\n\n🖼️ *Visual Breakdown*\n${chartUrl}`,
+    };
+  }
+
   private updateStatus(intent: ParsedIntent, projectId: string, sender: TeamMember): TaskResponse {
     const newStatus = intent.task?.status || 'done';
 
@@ -139,7 +243,7 @@ export class TaskManager {
         intent.task.relatedTaskId, projectId, newStatus, sender.id
       );
       if (task) {
-        const emoji = { todo: '📋', in_progress: '🔄', review: '👀', done: '✅', blocked: '🚫' };
+        const emoji = { todo: '📋', in_progress: '🔄', testing: '🧪', done: '✅' };
         return {
           message: `${emoji[newStatus as keyof typeof emoji] || '📋'} *Task #${task.displayId}* → *${newStatus.toUpperCase()}*\n📌 ${task.title}`,
           task,
@@ -257,37 +361,40 @@ export class TaskManager {
     };
   }
 
-  private assignTask(intent: ParsedIntent, projectId: string, sender: TeamMember): TaskResponse {
-    if (!intent.task?.relatedTaskId || !intent.task.assigneePhone) {
+  private assignTask(intent: ParsedIntent, projectId: string, sender: TeamMember, mentions: string[] = []): TaskResponse {
+    if (!intent.task?.relatedTaskId) {
       return { message: '❓ Usage: `!assign <task_id> @person`' };
     }
 
-    const assignee = database.findMemberByPhone(intent.task.assigneePhone);
+    // Try LLM-extracted phone, then WhatsApp mentions
+    let assignee = intent.task.assigneePhone
+      ? database.findMemberByPhone(intent.task.assigneePhone)
+      : undefined;
+
+    if (!assignee && mentions.length > 0) {
+      for (const mention of mentions) {
+        const found = database.findMemberByPhone(mention);
+        if (found) { assignee = found; break; }
+      }
+    }
+
     if (!assignee) {
       return { message: '❓ Could not find that team member.' };
     }
 
-    return {
-      message: `👤 *Task #${intent.task.relatedTaskId}* reassigned to *${assignee.name}*`,
-    };
-  }
-
-  private blockTask(intent: ParsedIntent, projectId: string, sender: TeamMember): TaskResponse {
-    if (!intent.task?.relatedTaskId) {
-      return { message: '❓ Usage: `!block <task_id> <reason>`' };
-    }
-
-    const task = database.updateTaskStatus(
-      intent.task.relatedTaskId, projectId, 'blocked', sender.id
-    );
-
+    // Actually update the task assignment in the database
+    const task = database.getTaskByDisplayId(intent.task.relatedTaskId, projectId);
     if (!task) return { message: '❓ Task not found.' };
 
+    database.updateTaskField(intent.task.relatedTaskId, projectId, 'assigned_to', assignee.id, sender.id);
+    const updated = database.getTaskByDisplayId(intent.task.relatedTaskId, projectId);
+
     return {
-      message: `🚫 *Task #${task.displayId} BLOCKED*\n📌 ${task.title}\n💬 Reason: ${intent.task.blockReason || 'Not specified'}`,
-      task,
+      message: `👤 *Task #${intent.task.relatedTaskId}* reassigned to *${assignee.name}*`,
+      task: updated || undefined,
     };
   }
+
 
   private editTask(intent: ParsedIntent, projectId: string, sender: TeamMember): TaskResponse {
     if (!intent.task?.relatedTaskId) {

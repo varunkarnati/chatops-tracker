@@ -1,4 +1,4 @@
-export type TaskStatus = 'todo' | 'in_progress' | 'review' | 'done' | 'blocked';
+export type TaskStatus = 'todo' | 'in_progress' | 'testing' | 'done';
 export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
 export type MemberRole = 'admin' | 'member' | 'viewer';
 
@@ -42,6 +42,7 @@ export interface ParsedIntent {
     | 'SHOW_HELP'
     | 'CREATE_CRON'
     | 'DELETE_CRON'
+    | 'DASHBOARD_CHART'
     | 'GENERAL_CHAT';
   task?: {
     title?: string;
@@ -58,6 +59,7 @@ export interface ParsedIntent {
     name?: string;
     schedule?: string;
     message?: string;
+    targetGroupId?: string;
   };
   confidence: number;
 }

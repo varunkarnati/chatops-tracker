@@ -12,6 +12,7 @@ interface CronJobRecord {
   messageTemplate?: string;
   targetGroupId: string;
   enabled: boolean;
+  createdBy?: string;
   lastRunAt?: string;
 }
 

@@ -15,6 +15,31 @@ import { mkdirSync } from 'fs';
 
 type MessageHandler = (msg: NormalizedMessage) => Promise<void>;
 
+/**
+ * LRU-style set for message deduplication.
+ * WhatsApp/Baileys can redeliver messages on reconnect or history sync.
+ */
+class MessageDedup {
+  private seen: Set<string> = new Set();
+  private queue: string[] = [];
+  private maxSize: number;
+
+  constructor(maxSize: number = 500) {
+    this.maxSize = maxSize;
+  }
+
+  isDuplicate(messageId: string): boolean {
+    if (this.seen.has(messageId)) return true;
+    this.seen.add(messageId);
+    this.queue.push(messageId);
+    if (this.queue.length > this.maxSize) {
+      const evicted = this.queue.shift()!;
+      this.seen.delete(evicted);
+    }
+    return false;
+  }
+}
+
 export class WhatsAppAdapter {
   private socket: ReturnType<typeof makeWASocket> | null = null;
   private messageHandler: MessageHandler | null = null;
@@ -23,6 +48,7 @@ export class WhatsAppAdapter {
   private lastQr: string | null = null;
   private reconnectInFlight = false;
   private reconnectAttempts = 0;
+  private dedup = new MessageDedup(500);
 
   async connect() {
     if (this.reconnectInFlight) return;
@@ -121,9 +147,20 @@ export class WhatsAppAdapter {
           continue;
         }
 
+        // Deduplication — skip messages we've already processed
+        const msgId = msg.key.id;
+        if (msgId && this.dedup.isDuplicate(msgId)) {
+          continue;
+        }
+
         const normalized = await this.normalizeMessage(msg, groupId);
         if (normalized && this.messageHandler) {
-          await this.messageHandler(normalized);
+          // Wrap handler in try-catch so one bad message doesn't break the loop
+          try {
+            await this.messageHandler(normalized);
+          } catch (error) {
+            console.error(`Error processing message ${normalized.id}:`, error);
+          }
         }
       }
     });
@@ -133,14 +170,45 @@ export class WhatsAppAdapter {
     this.messageHandler = handler;
   }
 
-  async sendToGroup(groupId: string, text: string) {
+  /**
+   * Send a text message to a group and return the sent message ID.
+   * The message ID is used by ThreadTracker to link bot replies to tasks.
+   */
+  async sendToGroup(groupId: string, text: string): Promise<string | undefined> {
     if (!this.socket) throw new Error('WhatsApp not connected');
-    await this.socket.sendMessage(groupId, { text });
+    
+    // Auto-detect QuickChart URLs and send as image
+    if (text.includes('https://quickchart.io/chart?c=')) {
+      const url = text.split('\n').find(l => l.startsWith('https://quickchart.io/chart?c=')) || text;
+      const caption = text.replace(url, '').trim();
+      const sentMsg = await this.socket.sendMessage(groupId, { 
+        image: { url }, 
+        caption: caption || 'Dashboard Chart' 
+      });
+      return sentMsg?.key?.id || undefined;
+    }
+
+    const sentMsg = await this.socket.sendMessage(groupId, { text });
+    return sentMsg?.key?.id || undefined;
   }
 
   async sendDM(jid: string, text: string) {
     if (!this.socket) throw new Error('WhatsApp not connected');
     await this.socket.sendMessage(jid, { text });
+  }
+
+  /**
+   * Disconnect cleanly — called during graceful shutdown.
+   */
+  disconnect() {
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
+    if (this.socket) {
+      this.socket.end(undefined);
+      this.socket = null;
+    }
   }
 
   private async normalizeMessage(msg: WAMessage, groupId: string): Promise<NormalizedMessage | null> {

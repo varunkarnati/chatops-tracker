@@ -1,5 +1,5 @@
 import { WhatsAppAdapter } from './whatsapp/adapter.js';
-import { parseCommand } from './parser/command-parser.js';
+import { parseCommand, CommandResult } from './parser/command-parser.js';
 import { parseLLM } from './parser/llm-parser.js';
 import { TaskManager } from './tasks/task-manager.js';
 import { database } from './db/database.js';
@@ -14,8 +14,9 @@ import { config } from './config.js';
 async function main() {
   console.log(`
   ╔═══════════════════════════════════════╗
-  ║     🤖 ChatOps Tracker v0.1.0        ║
+  ║     🤖 ChatOps Tracker v0.3.0        ║
   ║     WhatsApp → Task Management        ║
+  ║     Thread-Aware + Session Memory      ║
   ╚═══════════════════════════════════════╝
   `);
 
@@ -30,7 +31,14 @@ async function main() {
   // --- Initialize dashboard ---
   const dashboard = new DashboardServer(adapter);
 
-  const projectGroups = new Map<string, string>(); // groupId → projectId
+  // --- Load all known project groups from DB (survives restarts) ---
+  const projectGroups = database.getAllProjectGroups();
+  console.log(`📂 Loaded ${projectGroups.size} project groups from database`);
+
+  // Load cron jobs for all known projects at startup
+  for (const [_groupId, projectId] of projectGroups) {
+    cronManager.loadAll(projectId);
+  }
 
   // --- Message handler ---
   adapter.onMessage(async (msg) => {
@@ -41,6 +49,7 @@ async function main() {
       if (!projectGroups.has(msg.groupId)) {
         const projectId = database.getOrCreateProject(msg.groupId, msg.groupName);
         projectGroups.set(msg.groupId, projectId);
+        cronManager.loadAll(projectId);
       }
       const projectId = projectGroups.get(msg.groupId)!;
 
@@ -51,36 +60,121 @@ async function main() {
         projectId
       );
 
-      // 3. Try command-based parsing first (explicit commands are instant + free)
-      let intent = parseCommand(msg.text, msg.mentions);
+      // 3. Check for thread context (is this a reply to a task-related bot message?)
+      const threadContext = contextAssembler.threadTracker.resolveThread(msg);
+      if (threadContext) {
+        console.log(`🔗 Thread detected: reply to Task #${threadContext.taskDisplayId}`);
+      }
 
-      // 4. Handle SHOW_HELP separately (it goes through TaskManager.showHelp directly)
+      // 4. Try command-based parsing first (explicit commands are instant + free)
+      const commandResult: CommandResult = parseCommand(msg.text, msg.mentions);
+
+      // 5. Handle manager commands (skill/cron) — these are routed directly
+      if (commandResult?.kind === 'manager') {
+        const response = await handleManagerCommand(
+          commandResult.command, projectId, sender, msg.groupId, skillManager, cronManager
+        );
+        if (response) {
+          await adapter.sendToGroup(msg.groupId, response);
+        }
+        return;
+      }
+
+      // 6. Get the intent — from command or LLM
+      let intent = commandResult?.kind === 'intent' ? commandResult.intent : null;
+
+      // 7. Handle SHOW_HELP separately
       if (intent && intent.intent === 'SHOW_HELP') {
-        const helpSection = intent.task?.title; // 'skills', 'cron', or undefined
+        const helpSection = intent.task?.title;
         const response = taskManager.showHelp(helpSection);
         await adapter.sendToGroup(msg.groupId, response.message);
         return;
       }
 
-      // 5. If no command matched, try LLM-based parsing with full context
+      // 8. If no command matched, try LLM-based parsing with full context
       if (!intent) {
         console.log(`🤔 Thinking... (LLM)`);
-        const assembledPrompt = contextAssembler.assemblePrompt(msg, projectId);
+        const assembledPrompt = contextAssembler.assemblePrompt(msg, projectId, threadContext);
         intent = await parseLLM(msg.text, msg.senderName, msg.mentions, assembledPrompt);
       }
 
-      // 6. Handle the parsed intent
-      const response = taskManager.handleIntent(intent, projectId, sender, msg.mentions);
+      // 9. Thread-context intent correction:
+      //    When replying to a task message, NEVER create a new task.
+      //    Redirect to the appropriate update intent instead.
+      if (threadContext) {
+        if (intent.intent === 'CREATE_TASK') {
+          // A reply to a task that LLM classified as CREATE_TASK is almost certainly
+          // an update, assignment, or refinement — not a new task
+          if (msg.mentions.length > 0) {
+            console.log(`🔗 Thread redirect: CREATE_TASK → ASSIGN_TASK for Task #${threadContext.taskDisplayId}`);
+            intent = {
+              intent: 'ASSIGN_TASK',
+              task: { relatedTaskId: threadContext.taskDisplayId, assigneePhone: msg.mentions[0] },
+              confidence: intent.confidence,
+            };
+          } else {
+            console.log(`🔗 Thread redirect: CREATE_TASK → EDIT_TASK for Task #${threadContext.taskDisplayId}`);
+            intent = {
+              intent: 'EDIT_TASK',
+              task: {
+                relatedTaskId: threadContext.taskDisplayId,
+                editField: 'description',
+                editValue: msg.text,
+              },
+              confidence: intent.confidence,
+            };
+          }
+        }
 
-      // 7. Send response back to the group
+        // Inject relatedTaskId for any intent that operates on a task
+        if (intent.task === undefined) {
+          intent = { ...intent, task: { relatedTaskId: threadContext.taskDisplayId } };
+        } else if (!intent.task.relatedTaskId) {
+          intent = { ...intent, task: { ...intent.task, relatedTaskId: threadContext.taskDisplayId } };
+        }
+      }
+
+      // 9.5 Fallback: If no relatedTaskId was extracted but this is an update intent,
+      //     try to inject the last mentioned task from the user's session
+      const updateIntents = ['UPDATE_STATUS', 'ASSIGN_TASK', 'SET_DEADLINE', 'EDIT_TASK', 'ADD_COMMENT', 'SET_PRIORITY'];
+      if (!threadContext && updateIntents.includes(intent.intent) && (!intent.task || !intent.task.relatedTaskId)) {
+        const session = contextAssembler.sessionManager.getSession(sender.id, projectId);
+        if (session && session.lastTaskDisplayId) {
+          console.log(`🧠 Pronoun fallback: Injected Task #${session.lastTaskDisplayId} from session context`);
+          if (intent.task === undefined) {
+            intent = { ...intent, task: { relatedTaskId: session.lastTaskDisplayId } };
+          } else {
+            intent = { ...intent, task: { ...intent.task, relatedTaskId: session.lastTaskDisplayId } };
+          }
+        }
+      }
+
+      // 10. Handle the parsed intent
+      const response = taskManager.handleIntent(intent, projectId, sender, msg.mentions, msg.groupId);
+
+      // 11. Send response back to the group
       if (response) {
         console.log(`📤 Bot reply: ${response.message.substring(0, 80)}...`);
-        await adapter.sendToGroup(msg.groupId, response.message);
+        const sentMessageId = await adapter.sendToGroup(msg.groupId, response.message);
 
-        // 8. Broadcast to dashboard clients
+        // 12. Link bot reply to task for thread tracking
+        if (sentMessageId && response.task) {
+          contextAssembler.threadTracker.linkBotReply(sentMessageId, response.task, intent.intent);
+          console.log(`🔗 Linked message ${sentMessageId} → Task #${response.task.displayId}`);
+        }
+
+        // 13. Update user session (for pronoun resolution on next turn)
+        contextAssembler.sessionManager.recordAction(
+          sender.id, projectId, intent.intent, response.task
+        );
+
+        // 14. Broadcast to dashboard clients
         if (response.task) {
           dashboard.sync.broadcastToProject(projectId, 'task:updated', response.task);
         }
+      } else if (intent.intent !== 'GENERAL_CHAT') {
+        // Update session even for non-response intents (e.g., status queries that return inline)
+        contextAssembler.sessionManager.recordAction(sender.id, projectId, intent.intent);
       }
     } catch (error) {
       console.error('Error processing message:', error);
@@ -97,6 +191,163 @@ async function main() {
   dashboard.start();
 
   console.log('🚀 ChatOps Tracker is running!');
+
+  // --- Graceful shutdown ---
+  const shutdown = async (signal: string) => {
+    console.log(`\n${signal} received. Shutting down gracefully...`);
+    adapter.disconnect();
+    database.close();
+    console.log('✅ Cleanup complete. Goodbye!');
+    process.exit(0);
+  };
+
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+}
+
+/**
+ * Handle !skill and !cron commands by routing to the appropriate manager.
+ */
+async function handleManagerCommand(
+  command: { type: 'skill' | 'cron'; subcommand: string; args: string[] },
+  projectId: string,
+  sender: any,
+  groupId: string,
+  skillManager: SkillManager,
+  cronManager: CronManager,
+): Promise<string | null> {
+  if (command.type === 'skill') {
+    return handleSkillCommand(command.subcommand, command.args, projectId, sender, skillManager);
+  }
+  if (command.type === 'cron') {
+    return handleCronCommand(command.subcommand, command.args, projectId, sender, groupId, cronManager);
+  }
+  return null;
+}
+
+function handleSkillCommand(
+  subcommand: string, args: string[], projectId: string, sender: any, skillManager: SkillManager
+): string {
+  switch (subcommand) {
+    case 'list':
+      return skillManager.listSkills(projectId);
+
+    case 'add': {
+      const name = args[0];
+      if (!name) return '❓ Usage: `!skill add <name>`';
+      // Create with default triggers/behavior — user can edit later
+      skillManager.createSkill(name, [name], `Handle ${name}-related queries`, 'Respond naturally', projectId, sender.id)
+        .catch(e => console.error('Skill creation error:', e));
+      return `🎯 *Skill "${name}" created!* Use \`!skill edit ${name} trigger <keywords>\` to customize.`;
+    }
+
+    case 'info': {
+      const name = args[0];
+      if (!name) return '❓ Usage: `!skill info <name>`';
+      // Return skill details
+      return `🎯 Skill info for "${name}" — use \`!skill list\` to see all skills.`;
+    }
+
+    case 'disable': {
+      const name = args[0];
+      if (!name) return '❓ Usage: `!skill disable <name>`';
+      try {
+        skillManager.toggleSkill(name, false);
+        return `⏸️ Skill "${name}" disabled.`;
+      } catch (e: any) {
+        return `❌ ${e.message}`;
+      }
+    }
+
+    case 'enable': {
+      const name = args[0];
+      if (!name) return '❓ Usage: `!skill enable <name>`';
+      try {
+        skillManager.toggleSkill(name, true);
+        return `🟢 Skill "${name}" re-enabled.`;
+      } catch (e: any) {
+        return `❌ ${e.message}`;
+      }
+    }
+
+    case 'delete': {
+      const name = args[0];
+      if (!name) return '❓ Usage: `!skill delete <name>`';
+      try {
+        skillManager.deleteSkill(name);
+        return `🗑️ Skill "${name}" deleted.`;
+      } catch (e: any) {
+        return `❌ ${e.message}`;
+      }
+    }
+
+    case 'edit': {
+      const name = args[0];
+      const field = args[1];
+      const value = args.slice(2).join(' ');
+      if (!name || !field || !value) return '❓ Usage: `!skill edit <name> trigger <keywords>`';
+      if (field === 'trigger' || field === 'triggers') {
+        try {
+          skillManager.editTriggers(name, value.split(',').map(t => t.trim()));
+          return `✏️ Triggers for "${name}" updated: ${value}`;
+        } catch (e: any) {
+          return `❌ ${e.message}`;
+        }
+      }
+      return `❓ Unknown field "${field}". Supported: trigger`;
+    }
+
+    default:
+      return `❓ Unknown skill subcommand: "${subcommand}". Try \`!help skills\``;
+  }
+}
+
+function handleCronCommand(
+  subcommand: string, args: string[], projectId: string, sender: any, groupId: string, cronManager: CronManager
+): string {
+  switch (subcommand) {
+    case 'list':
+      return cronManager.listJobs(projectId);
+
+    case 'pause': {
+      const id = parseInt(args[0]);
+      if (isNaN(id)) return '❓ Usage: `!cron pause <id>`';
+      try {
+        cronManager.toggleJob(id, projectId, false);
+        return `⏸️ Cron job #${id} paused.`;
+      } catch (e: any) {
+        return `❌ ${e.message}`;
+      }
+    }
+
+    case 'resume': {
+      const id = parseInt(args[0]);
+      if (isNaN(id)) return '❓ Usage: `!cron resume <id>`';
+      try {
+        cronManager.toggleJob(id, projectId, true);
+        return `🟢 Cron job #${id} resumed.`;
+      } catch (e: any) {
+        return `❌ ${e.message}`;
+      }
+    }
+
+    case 'run': {
+      const id = parseInt(args[0]);
+      if (isNaN(id)) return '❓ Usage: `!cron run <id>`';
+      cronManager.runNow(id, projectId).catch(e => console.error('Cron run error:', e));
+      return `▶️ Running cron job #${id} now...`;
+    }
+
+    case 'delete': {
+      const id = parseInt(args[0]);
+      if (isNaN(id)) return '❓ Usage: `!cron delete <id>`';
+      cronManager.deleteJob(id, projectId);
+      return `🗑️ Cron job #${id} deleted.`;
+    }
+
+    default:
+      return `❓ Unknown cron subcommand: "${subcommand}". Try \`!help cron\``;
+  }
 }
 
 main().catch(console.error);

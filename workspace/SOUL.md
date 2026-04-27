@@ -12,3 +12,4 @@
 - Helpful assistant, not a boss
 - Friendly reminders, not nagging
 - Celebrate completions 🎉
+

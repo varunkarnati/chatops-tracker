@@ -1,36 +1,47 @@
-import { NormalizedMessage } from '../tasks/models.js';
+import { database } from '../db/database.js';
 
 /**
- * Ring buffer of last N messages per group — keeps conversation context
- * for the LLM to understand reply chains and pronouns like "it", "that", etc.
+ * GroupHistory — persistent conversation memory per WhatsApp group.
+ *
+ * Previously an in-memory ring buffer that was lost on restart.
+ * Now backed by SQLite — the bot remembers conversations across restarts.
+ *
+ * Messages are stored in the group_messages table and queried
+ * on demand for the LLM context window.
  */
 export class GroupHistory {
-  private history: Map<string, Array<{ sender: string; text: string; timestamp: number }>> = new Map();
   private maxMessages: number;
 
-  constructor(maxMessages: number = 20) {
+  constructor(maxMessages: number = 30) {
     this.maxMessages = maxMessages;
   }
 
-  add(groupId: string, sender: string, text: string, timestamp: number) {
-    if (!this.history.has(groupId)) this.history.set(groupId, []);
-    const arr = this.history.get(groupId)!;
-    arr.push({ sender, text, timestamp });
-    if (arr.length > this.maxMessages) arr.shift();
+  /**
+   * Store a message in persistent history.
+   */
+  add(groupId: string, senderName: string, senderId: string, text: string, messageId?: string, quotedMessageId?: string, timestamp?: number) {
+    const ts = timestamp || Math.floor(Date.now() / 1000);
+    database.storeGroupMessage(groupId, senderName, senderId, text, messageId, quotedMessageId, ts);
   }
 
+  /**
+   * Get recent conversation context for LLM prompt injection.
+   */
   getContext(groupId: string): string {
-    const msgs = this.history.get(groupId) || [];
+    const msgs = database.getRecentGroupMessages(groupId, this.maxMessages);
     if (msgs.length === 0) return '';
 
-    let ctx = `## Recent Group Messages (last ${msgs.length})\n`;
+    let ctx = `## Recent Group Conversation (last ${msgs.length} messages)\n`;
     for (const m of msgs) {
-      ctx += `[${m.sender}]: ${m.text}\n`;
+      ctx += `[${m.senderName}]: ${m.text}\n`;
     }
     return ctx;
   }
 
-  clear(groupId: string) {
-    this.history.delete(groupId);
+  /**
+   * Get raw messages (for thread resolution, etc.).
+   */
+  getRecentMessages(groupId: string, limit?: number) {
+    return database.getRecentGroupMessages(groupId, limit || this.maxMessages);
   }
 }

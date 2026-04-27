@@ -25,11 +25,27 @@ export class DashboardServer {
     this.auth = new DashboardAuth(adapter);
     this.sync = new DashboardSync(this.server, this.auth);
 
+    this.app.use(express.static('src/dashboard/public'));
+
     this.setupRoutes();
   }
 
   private setupRoutes() {
     const authMiddleware = createAuthMiddleware(this.auth);
+
+    // --- Public Routes ---
+    this.app.get('/api/public/tasks', (req, res) => {
+      const projects = database.getProjects();
+      if (projects.length === 0) return res.json([]);
+      const projectId = projects[0].id;
+      const tasks = database.getTasksByProject(projectId);
+      const doneTasks = database.getTasksByProject(projectId, 'done');
+      const all = [...tasks, ...doneTasks].map(t => ({
+        ...t,
+        assigneeName: t.assignedTo ? database.findMemberById(t.assignedTo)?.name : null
+      }));
+      res.json(all);
+    });
 
     // --- Auth Routes (no JWT required) ---
     this.app.post('/auth/request-code', async (req, res) => {

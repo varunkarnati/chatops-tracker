@@ -96,6 +96,48 @@ db.exec(`
     last_run_at DATETIME,
     next_run_at DATETIME
   );
+
+  -- Thread tracking: maps bot reply messages to tasks
+  CREATE TABLE IF NOT EXISTS message_task_links (
+    bot_message_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    task_display_id INTEGER NOT NULL,
+    project_id TEXT NOT NULL,
+    intent TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  -- Persistent group message history (replaces in-memory ring buffer)
+  CREATE TABLE IF NOT EXISTS group_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id TEXT NOT NULL,
+    sender_name TEXT NOT NULL,
+    sender_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    message_id TEXT,
+    quoted_message_id TEXT,
+    timestamp INTEGER NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  -- Per-user session state for pronoun resolution and context
+  CREATE TABLE IF NOT EXISTS user_sessions (
+    user_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    last_task_id TEXT,
+    last_task_display_id INTEGER,
+    last_action TEXT,
+    last_intent TEXT,
+    recent_intents TEXT DEFAULT '[]',
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, project_id)
+  );
+
+  -- Indexes for performance
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_task_display_id ON tasks(project_id, display_id);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_cron_display_id ON cron_jobs(project_id, display_id);
+  CREATE INDEX IF NOT EXISTS idx_group_messages_group ON group_messages(group_id, timestamp DESC);
+  CREATE INDEX IF NOT EXISTS idx_group_messages_msg_id ON group_messages(message_id);
 `);
 
 // ============================================================
@@ -147,6 +189,19 @@ export const database = {
       'INSERT INTO projects (id, name, whatsapp_group_id) VALUES (?, ?, ?)'
     ).run(id, groupName, groupId);
     return id;
+  },
+
+  getProjects(): Array<{ id: string; name: string; whatsapp_group_id: string }> {
+    return db.prepare('SELECT id, name, whatsapp_group_id FROM projects ORDER BY created_at ASC').all() as any[];
+  },
+
+  getAllProjectGroups(): Map<string, string> {
+    const rows = db.prepare('SELECT whatsapp_group_id, id FROM projects').all() as any[];
+    const map = new Map<string, string>();
+    for (const row of rows) {
+      if (row.whatsapp_group_id) map.set(row.whatsapp_group_id, row.id);
+    }
+    return map;
   },
 
   // --- Team Members ---
@@ -249,7 +304,7 @@ export const database = {
 
     if (!task) return null;
 
-    const allowedFields = ['title', 'description', 'priority', 'status'];
+    const allowedFields = ['title', 'description', 'priority', 'status', 'assigned_to'];
     if (!allowedFields.includes(field)) return null;
 
     const oldValue = (task as any)[field];
@@ -390,5 +445,104 @@ export const database = {
       ORDER BY th.changed_at DESC
       LIMIT ?
     `).all(projectId, limit);
+  },
+
+  // --- Message Thread Tracking ---
+  linkMessageToTask(botMessageId: string, taskId: string, taskDisplayId: number, projectId: string, intent: string): void {
+    db.prepare(`
+      INSERT OR REPLACE INTO message_task_links (bot_message_id, task_id, task_display_id, project_id, intent)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(botMessageId, taskId, taskDisplayId, projectId, intent);
+  },
+
+  getTaskByBotMessageId(botMessageId: string): { taskId: string; taskDisplayId: number; projectId: string; intent: string } | undefined {
+    const row = db.prepare(
+      'SELECT task_id, task_display_id, project_id, intent FROM message_task_links WHERE bot_message_id = ?'
+    ).get(botMessageId) as any;
+    if (!row) return undefined;
+    return {
+      taskId: row.task_id,
+      taskDisplayId: row.task_display_id,
+      projectId: row.project_id,
+      intent: row.intent,
+    };
+  },
+
+  // --- Persistent Group History ---
+  storeGroupMessage(groupId: string, senderName: string, senderId: string, text: string, messageId: string | undefined, quotedMessageId: string | undefined, timestamp: number): void {
+    db.prepare(`
+      INSERT INTO group_messages (group_id, sender_name, sender_id, text, message_id, quoted_message_id, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(groupId, senderName, senderId, text, messageId || null, quotedMessageId || null, timestamp);
+  },
+
+  getRecentGroupMessages(groupId: string, limit: number = 20): Array<{ senderName: string; senderId: string; text: string; messageId: string | null; timestamp: number }> {
+    return db.prepare(`
+      SELECT sender_name as senderName, sender_id as senderId, text, message_id as messageId, timestamp
+      FROM group_messages
+      WHERE group_id = ?
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `).all(groupId, limit).reverse() as any[];
+  },
+
+  getMessageByMessageId(messageId: string): { senderName: string; text: string; timestamp: number } | undefined {
+    return db.prepare(
+      'SELECT sender_name as senderName, text, timestamp FROM group_messages WHERE message_id = ? LIMIT 1'
+    ).get(messageId) as any;
+  },
+
+  // --- User Sessions ---
+  getUserSession(userId: string, projectId: string): { lastTaskId: string | null; lastTaskDisplayId: number | null; lastAction: string | null; lastIntent: string | null; recentIntents: string[] } {
+    const row = db.prepare(
+      'SELECT last_task_id, last_task_display_id, last_action, last_intent, recent_intents FROM user_sessions WHERE user_id = ? AND project_id = ?'
+    ).get(userId, projectId) as any;
+
+    if (!row) {
+      return { lastTaskId: null, lastTaskDisplayId: null, lastAction: null, lastIntent: null, recentIntents: [] };
+    }
+    return {
+      lastTaskId: row.last_task_id,
+      lastTaskDisplayId: row.last_task_display_id,
+      lastAction: row.last_action,
+      lastIntent: row.last_intent,
+      recentIntents: JSON.parse(row.recent_intents || '[]'),
+    };
+  },
+
+  updateUserSession(userId: string, projectId: string, update: { lastTaskId?: string; lastTaskDisplayId?: number; lastAction?: string; lastIntent?: string }): void {
+    const existing = db.prepare(
+      'SELECT recent_intents FROM user_sessions WHERE user_id = ? AND project_id = ?'
+    ).get(userId, projectId) as any;
+
+    let recentIntents: string[] = existing ? JSON.parse(existing.recent_intents || '[]') : [];
+    if (update.lastIntent) {
+      recentIntents.push(update.lastIntent);
+      if (recentIntents.length > 5) recentIntents = recentIntents.slice(-5);
+    }
+
+    db.prepare(`
+      INSERT INTO user_sessions (user_id, project_id, last_task_id, last_task_display_id, last_action, last_intent, recent_intents, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(user_id, project_id) DO UPDATE SET
+        last_task_id = COALESCE(excluded.last_task_id, last_task_id),
+        last_task_display_id = COALESCE(excluded.last_task_display_id, last_task_display_id),
+        last_action = COALESCE(excluded.last_action, last_action),
+        last_intent = COALESCE(excluded.last_intent, last_intent),
+        recent_intents = excluded.recent_intents,
+        updated_at = CURRENT_TIMESTAMP
+    `).run(
+      userId, projectId,
+      update.lastTaskId || null,
+      update.lastTaskDisplayId || null,
+      update.lastAction || null,
+      update.lastIntent || null,
+      JSON.stringify(recentIntents)
+    );
+  },
+
+  // --- Cleanup ---
+  close(): void {
+    db.close();
   },
 };

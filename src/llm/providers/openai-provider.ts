@@ -1,6 +1,7 @@
 import type { LlmProviderName } from '../../config.js';
-import { parseJsonResponse } from '../http.js';
 import type { JsonCompletionRequest, LlmProviderClient } from '../types.js';
+
+const REQUEST_TIMEOUT_MS = 30_000; // 30 seconds
 
 export class OpenAIProvider implements LlmProviderClient {
   readonly name: LlmProviderName;
@@ -14,8 +15,6 @@ export class OpenAIProvider implements LlmProviderClient {
   }
 
   async completeJson(request: JsonCompletionRequest): Promise<string> {
-    // Build request body — only include response_format for native OpenAI
-    // Many OpenAI-compatible APIs (NVIDIA, Groq, etc.) don't support it
     const body: Record<string, any> = {
       model: request.model,
       messages: [
@@ -24,6 +23,7 @@ export class OpenAIProvider implements LlmProviderClient {
       ],
       temperature: request.temperature ?? 0.1,
       max_tokens: request.maxTokens ?? 4096,
+      stream: true, // Enable streaming
     };
 
     // Only add json mode for the native OpenAI API
@@ -31,60 +31,130 @@ export class OpenAIProvider implements LlmProviderClient {
       body.response_format = { type: 'json_object' };
     }
 
-    const response = await fetch(`${this.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(body),
-    });
+    // AbortController for timeout
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-    const payload = await parseJsonResponse(response, this.name);
+    try {
+      const response = await fetch(`${this.baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
 
-    // Handle standard OpenAI response shape
-    const choice = payload?.choices?.[0];
-    if (!choice) {
-      console.error(`[${this.name}] No choices in response:`, JSON.stringify(payload).substring(0, 500));
-      throw new Error(`${this.name} returned no choices in response.`);
-    }
-
-    const message = choice.message || choice.delta;
-    let content = message?.content;
-
-    // Handle string content (most common)
-    if (typeof content === 'string' && content.trim()) {
-      return content;
-    }
-
-    // Handle array content (some providers return parts)
-    if (Array.isArray(content)) {
-      const combined = content
-        .map((part: any) => (typeof part?.text === 'string' ? part.text : typeof part === 'string' ? part : ''))
-        .join('');
-      if (combined.trim()) return combined;
-    }
-
-    // Reasoning models (DeepSeek, GLM, etc.) put thinking in reasoning_content
-    // and the actual answer in content. If content is empty but reasoning has
-    // JSON embedded in it, try to extract the JSON from reasoning_content.
-    const reasoning = message?.reasoning_content;
-    if (typeof reasoning === 'string' && reasoning.trim()) {
-      const jsonMatch = reasoning.match(/\{[\s\S]*"intent"[\s\S]*\}/);
-      if (jsonMatch) {
-        console.log(`[${this.name}] Extracted JSON from reasoning_content`);
-        return jsonMatch[0];
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`[${this.name}] HTTP ${response.status} response:`, errorText.substring(0, 800));
+        throw new Error(`${this.name} request failed (${response.status}): ${errorText.substring(0, 600)}`);
       }
+
+      if (!response.body) {
+        throw new Error(`${this.name} returned no response body for streaming.`);
+      }
+
+      // Stream SSE chunks and accumulate content
+      const result = await this.readStream(response.body);
+
+      if (result.content.trim()) {
+        return result.content;
+      }
+
+      // Fallback: check reasoning_content for reasoning models (DeepSeek, GLM)
+      if (result.reasoningContent.trim()) {
+        const jsonMatch = result.reasoningContent.match(/\{[\s\S]*"intent"[\s\S]*\}/);
+        if (jsonMatch) {
+          console.log(`[${this.name}] Extracted JSON from streamed reasoning_content`);
+          return jsonMatch[0];
+        }
+      }
+
+      throw new Error(`${this.name} streaming returned empty content.`);
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        throw new Error(`${this.name} request timed out after ${REQUEST_TIMEOUT_MS / 1000}s`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
     }
+  }
 
-    // Try the full message text field as fallback
-    if (typeof message?.text === 'string' && message.text.trim()) {
-      return message.text;
+  /**
+   * Read an SSE stream from an OpenAI-compatible API.
+   * Accumulates content and reasoning_content from delta chunks.
+   */
+  private async readStream(body: ReadableStream<Uint8Array>): Promise<{ content: string; reasoningContent: string }> {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let content = '';
+    let reasoningContent = '';
+    let buffer = '';
+    let chunkCount = 0;
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // Process complete SSE lines
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // Keep incomplete line in buffer
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+
+          if (trimmed === '' || trimmed.startsWith(':')) continue; // Skip empty lines and comments
+
+          if (trimmed === 'data: [DONE]') {
+            continue;
+          }
+
+          if (trimmed.startsWith('data: ')) {
+            const jsonStr = trimmed.slice(6); // Remove 'data: ' prefix
+            try {
+              const chunk = JSON.parse(jsonStr);
+              const delta = chunk?.choices?.[0]?.delta;
+
+              if (delta?.content) {
+                content += delta.content;
+                chunkCount++;
+              }
+              if (delta?.reasoning_content) {
+                reasoningContent += delta.reasoning_content;
+              }
+            } catch {
+              // Skip malformed JSON chunks — this can happen with partial data
+            }
+          }
+        }
+      }
+
+      // Process any remaining buffer
+      if (buffer.trim()) {
+        const trimmed = buffer.trim();
+        if (trimmed.startsWith('data: ') && trimmed !== 'data: [DONE]') {
+          try {
+            const chunk = JSON.parse(trimmed.slice(6));
+            const delta = chunk?.choices?.[0]?.delta;
+            if (delta?.content) content += delta.content;
+            if (delta?.reasoning_content) reasoningContent += delta.reasoning_content;
+          } catch {
+            // Skip
+          }
+        }
+      }
+
+      console.log(`[${this.name}] Streamed ${chunkCount} chunks, ${content.length} chars`);
+      return { content, reasoningContent };
+
+    } finally {
+      reader.releaseLock();
     }
-
-    const finishReason = choice.finish_reason || choice.finishReason;
-    console.error(`[${this.name}] Empty content. finish_reason: ${finishReason}, message:`, JSON.stringify(message).substring(0, 500));
-
-    throw new Error(`${this.name} returned an empty completion payload (finish_reason: ${finishReason}).`);
   }
 }

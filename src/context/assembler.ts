@@ -3,23 +3,32 @@ import { join } from 'path';
 import { NormalizedMessage } from '../tasks/models.js';
 import { SkillRegistry } from './skill-registry.js';
 import { GroupHistory } from './group-history.js';
+import { ThreadTracker, ThreadContext } from './thread-tracker.js';
+import { SessionManager } from './session-manager.js';
 import { database } from '../db/database.js';
 
 /**
- * ContextAssembler — builds the full system prompt per turn by composing:
- * Layer 1: AGENT.md (core rules)
- * Layer 2: SOUL.md (personality)
- * Layer 3: Matched skill (selectively injected)
- * Layer 4: Board snapshot (from DB)
- * Layer 5: Team context (from DB)
- * Layer 6: Recent group messages (ring buffer)
- * Layer 7: Dynamic metadata (date, time, group)
+ * ContextAssembler — builds the full system prompt per turn by composing 9 layers:
+ *
+ * Layer 1: AGENT.md (core rules & allowed intents)
+ * Layer 2: SOUL.md (personality & communication style)
+ * Layer 3: Matched skill (selectively injected based on message triggers)
+ * Layer 4: Board snapshot (live task state from DB)
+ * Layer 5: Team context (members & workload from DB)
+ * Layer 6: Thread context (if replying to a task-related bot message) ← NEW
+ * Layer 7: User session (last task, pronoun resolution hints) ← NEW
+ * Layer 8: Recent group messages (from DB, persistent across restarts) ← UPGRADED
+ * Layer 9: Dynamic metadata (date, time, group name)
+ *
+ * Inspired by OpenClaw's memory/skill injection architecture.
  */
 export class ContextAssembler {
   private agentPrompt: string;
   private soulPrompt: string;
   public skillRegistry: SkillRegistry;
   public groupHistory: GroupHistory;
+  public threadTracker: ThreadTracker;
+  public sessionManager: SessionManager;
 
   constructor(workspacePath: string) {
     const agentPath = join(workspacePath, 'AGENT.md');
@@ -29,10 +38,20 @@ export class ContextAssembler {
     this.soulPrompt = existsSync(soulPath) ? readFileSync(soulPath, 'utf-8') : '';
     this.skillRegistry = new SkillRegistry();
     this.skillRegistry.loadFromDirectory(join(workspacePath, 'skills'));
-    this.groupHistory = new GroupHistory();
+    this.groupHistory = new GroupHistory(30);
+    this.threadTracker = new ThreadTracker();
+    this.sessionManager = new SessionManager();
   }
 
-  assemblePrompt(message: NormalizedMessage, projectId: string): string {
+  /**
+   * Assemble the full system prompt for a given message.
+   * Thread context and session are injected when available.
+   */
+  assemblePrompt(
+    message: NormalizedMessage,
+    projectId: string,
+    threadContext?: ThreadContext | null,
+  ): string {
     const parts: string[] = [];
 
     // Layer 1: Core Identity & Rules
@@ -53,18 +72,37 @@ export class ContextAssembler {
     // Layer 5: Team Context
     parts.push(this.getTeamContext(projectId));
 
-    // Layer 6: Recent Conversation History
+    // Layer 6: Thread Context (NEW — if replying to a task message)
+    if (threadContext) {
+      parts.push(this.threadTracker.buildThreadPrompt(threadContext));
+    }
+
+    // Layer 7: User Session (NEW — pronoun resolution, continuity)
+    const senderId = message.senderId.replace('@s.whatsapp.net', '');
+    const session = this.sessionManager.getSession(senderId, projectId);
+    const sessionPrompt = this.sessionManager.buildSessionPrompt(session, senderId);
+    if (sessionPrompt) parts.push(sessionPrompt);
+
+    // Layer 8: Recent Conversation History (UPGRADED — now DB-backed)
     const history = this.groupHistory.getContext(message.groupId);
     if (history) parts.push(history);
 
-    // Layer 7: Dynamic Metadata
+    // Layer 9: Dynamic Metadata
     parts.push(`## Current Context`);
     parts.push(`Today: ${new Date().toISOString().split('T')[0]}`);
     parts.push(`Current time: ${new Date().toLocaleTimeString()}`);
     parts.push(`Group: ${message.groupName}`);
 
-    // Track this message in history for next turn
-    this.groupHistory.add(message.groupId, message.senderName, message.text, message.timestamp);
+    // Store this message in persistent history for next turn
+    this.groupHistory.add(
+      message.groupId,
+      message.senderName,
+      message.senderId,
+      message.text,
+      message.id,
+      message.quotedMessage?.id,
+      message.timestamp,
+    );
 
     return parts.join('\n\n---\n\n');
   }

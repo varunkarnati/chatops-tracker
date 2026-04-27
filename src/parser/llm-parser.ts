@@ -17,17 +17,34 @@ const ALLOWED_INTENTS = new Set<ParsedIntent['intent']>([
   'QUERY_STATUS',
   'ADD_COMMENT',
   'SET_PRIORITY',
-  'BLOCK_TASK',
   'EDIT_TASK',
   'DELETE_TASK',
   'SHOW_HELP',
   'CREATE_CRON',
   'DELETE_CRON',
+  'DASHBOARD_CHART',
   'GENERAL_CHAT',
 ]);
 
-const ALLOWED_STATUSES = new Set<TaskStatus>(['todo', 'in_progress', 'review', 'done', 'blocked']);
+const ALLOWED_STATUSES = new Set<TaskStatus>(['todo', 'in_progress', 'testing', 'done']);
 const ALLOWED_PRIORITIES = new Set<TaskPriority>(['low', 'medium', 'high', 'critical']);
+
+/**
+ * Fast-path patterns for recurring/scheduled messages.
+ * These bypass the LLM entirely and go straight to CREATE_CRON.
+ */
+const CRON_FAST_PATTERNS = [
+  /every\s+day\b/i,
+  /\bdaily\b.*\b(?:remind|standup|report|check|notify|alert|meet|meeting)/i,
+  /\b(?:remind|standup|report|check|notify|alert|meet|meeting)\b.*\bdaily\b/i,
+  /every\s+(?:morning|evening|night|monday|tuesday|wednesday|thursday|friday|saturday|sunday)/i,
+  /\bweekly\b.*\b(?:remind|report|standup|meet|meeting)/i,
+  /\b(?:remind|report|standup|meet|meeting)\b.*\bweekly\b/i,
+  /every\s+\d+\s*(?:hour|minute|min)/i,
+  /\b(?:remind|notify|alert)\s+(?:us|me|team)\s+(?:at|every)\b/i,
+  /\bat\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\s+(?:every|daily|weekly)/i,
+  /every\s+day\s+(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)?/i,
+];
 
 let provider: LlmProviderClient | null = null;
 
@@ -41,6 +58,27 @@ export async function parseLLM(
     return { intent: 'GENERAL_CHAT', confidence: 1.0 };
   }
 
+  // --- Fast Fallback (No LLM needed) ---
+  const lower = text.toLowerCase();
+  if (lower.includes('dashboard') || lower.includes('chart') || lower.includes('visual report')) {
+    return { intent: 'DASHBOARD_CHART', confidence: 1.0 };
+  }
+  if (lower.includes('status') && (lower.includes('all') || lower.includes('project'))) {
+    return { intent: 'QUERY_STATUS', confidence: 1.0 };
+  }
+
+  // --- Cron Fast-Path: detect recurring schedule requests before calling LLM ---
+  const isCronLike = CRON_FAST_PATTERNS.some(p => p.test(text));
+  if (isCronLike) {
+    // Try to extract time and build a cron schedule
+    const cronResult = tryFastCronParse(text);
+    if (cronResult) {
+      console.log(`⚡ Fast-path CRON detected: schedule=${cronResult.cron?.schedule}`);
+      return cronResult;
+    }
+    // If fast parse fails, fall through to LLM but with cron hint
+  }
+
   const defaultSystemPrompt = `You are a task-tracking assistant analyzing WhatsApp group messages for a software team.
 
 Your job: classify each message and extract structured task or cron data.
@@ -50,19 +88,26 @@ RULES:
 1. One-off work items (e.g. "Fix the login bug", "I'll do the docs") -> CREATE_TASK.
 2. Recurring events, scheduled reminders, or messages with a specific frequency (e.g. "Every day at...", "Remind us at 11pm", "Standup at 10am daily") -> CREATE_CRON.
 3. If it has a frequency or recurring time, it is ALWAYS a CRON job, NOT a task.
-4. For CREATE_CRON, always provide a "schedule" (cron format or natural time) and a "message".
+4. For CREATE_CRON, always provide a "schedule" in standard 5-field cron format (minute hour day-of-month month day-of-week) and a "message".
+5. Examples of cron schedules: "0 9 * * *" = every day at 9 AM, "30 23 * * *" = every day at 11:30 PM, "0 10 * * 1-5" = weekdays at 10 AM.
+6. When a user replies to a task confirmation message, interpret it as an update to that task, NOT a new task.
+7. For UPDATE_STATUS, always include "relatedTaskId" as a number.
+8. If the user refers to a task by name (e.g., "move the login task to testing") without the ID, YOU MUST FIND the task in the 'Current Board State' snapshot, extract its #ID, and output it as "relatedTaskId".
 
 JSON schema:
 {
-  "intent": "CREATE_TASK|UPDATE_STATUS|ASSIGN_TASK|SET_DEADLINE|QUERY_STATUS|ADD_COMMENT|SET_PRIORITY|BLOCK_TASK|EDIT_TASK|DELETE_TASK|CREATE_CRON|DELETE_CRON|GENERAL_CHAT",
+  "intent": "CREATE_TASK|UPDATE_STATUS|ASSIGN_TASK|SET_DEADLINE|QUERY_STATUS|ADD_COMMENT|SET_PRIORITY|EDIT_TASK|DELETE_TASK|CREATE_CRON|DELETE_CRON|GENERAL_CHAT",
   "task": {
     "title": "string|null",
     "assigneePhone": "use phone from mentions or null",
-    "deadline": "string|null"
+    "deadline": "string|null",
+    "status": "todo|in_progress|testing|done",
+    "relatedTaskId": "number|null",
+    "priority": "low|medium|high|critical"
   },
   "cron": {
     "name": "short name for reminder",
-    "schedule": "cron format (e.g. '22 23 * * *' for 11:22 PM) or natural time",
+    "schedule": "5-field cron format ONLY (e.g. '0 22 * * *' for 10 PM daily)",
     "message": "message to send when triggered"
   },
   "confidence": 0.0
@@ -72,10 +117,17 @@ Today: ${new Date().toISOString().split('T')[0]}`;
 
   try {
     const llm = getProvider();
+
+    // Add cron hint to user prompt if we detected a cron-like pattern
+    let userPrompt = `Sender: ${senderName}\nMentions: ${mentions.join(', ') || 'none'}\nMessage: "${text}"`;
+    if (isCronLike) {
+      userPrompt += `\n\nHINT: This message appears to describe a RECURRING schedule. Classify as CREATE_CRON with a valid 5-field cron schedule.`;
+    }
+
     const raw = await llm.completeJson({
       model: config.llmModel,
       systemPrompt: systemPromptOverride || defaultSystemPrompt,
-      userPrompt: `Sender: ${senderName}\nMentions: ${mentions.join(', ') || 'none'}\nMessage: "${text}"`,
+      userPrompt,
       temperature: 0.1,
       maxTokens: 2048,
     });
@@ -93,6 +145,72 @@ Today: ${new Date().toISOString().split('T')[0]}`;
   }
 }
 
+/**
+ * Try to extract time from a natural language recurring schedule.
+ * Returns a CREATE_CRON intent with a valid 5-field cron schedule, or null.
+ */
+function tryFastCronParse(text: string): ParsedIntent | null {
+  // Match patterns like "at 11:22 PM", "at 9 AM", "at 23:00"
+  const timeMatch = text.match(/(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm|AM|PM)?/i);
+  if (!timeMatch) return null;
+
+  let hour = parseInt(timeMatch[1]);
+  const minute = parseInt(timeMatch[2] || '0');
+  const ampm = timeMatch[3]?.toLowerCase();
+
+  if (ampm === 'pm' && hour < 12) hour += 12;
+  if (ampm === 'am' && hour === 12) hour = 0;
+
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+
+  // Determine day-of-week
+  const lower = text.toLowerCase();
+  let dayOfWeek = '* * *'; // default: every day
+  if (/\bweekday/i.test(lower) || /\bmon.*fri/i.test(lower)) {
+    dayOfWeek = '* * 1-5';
+  } else if (/\bweekend/i.test(lower)) {
+    dayOfWeek = '* * 0,6';
+  } else if (/\bmonday/i.test(lower)) {
+    dayOfWeek = '* * 1';
+  } else if (/\btuesday/i.test(lower)) {
+    dayOfWeek = '* * 2';
+  } else if (/\bwednesday/i.test(lower)) {
+    dayOfWeek = '* * 3';
+  } else if (/\bthursday/i.test(lower)) {
+    dayOfWeek = '* * 4';
+  } else if (/\bfriday/i.test(lower)) {
+    dayOfWeek = '* * 5';
+  } else if (/\bsaturday/i.test(lower)) {
+    dayOfWeek = '* * 6';
+  } else if (/\bsunday/i.test(lower)) {
+    dayOfWeek = '* * 0';
+  }
+
+  const schedule = `${minute} ${hour} ${dayOfWeek}`;
+
+  // Extract a meaningful name/message from the text
+  const cleanedText = text
+    .replace(/every\s+day\b/i, '')
+    .replace(/\bdaily\b/i, '')
+    .replace(/\bweekly\b/i, '')
+    .replace(/\bat\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?/i, '')
+    .replace(/\bremind\s+(?:us|me|team)\s+(?:to\s+)?/i, '')
+    .trim();
+
+  const messageName = cleanedText || 'Scheduled reminder';
+  const timeStr = `${hour > 12 ? hour - 12 : hour}:${String(minute).padStart(2, '0')} ${hour >= 12 ? 'PM' : 'AM'}`;
+
+  return {
+    intent: 'CREATE_CRON',
+    cron: {
+      name: messageName.length > 50 ? messageName.substring(0, 50) : messageName,
+      schedule,
+      message: cleanedText || `⏰ Reminder: ${messageName}`,
+    },
+    confidence: 0.95,
+  };
+}
+
 function getProvider(): LlmProviderClient {
   if (!provider) {
     provider = createLlmProvider(config);
@@ -101,7 +219,8 @@ function getProvider(): LlmProviderClient {
 }
 
 function extractJsonPayload(raw: string): string {
-  let cleaned = raw.trim();
+  // Strip out any reasoning blocks before trying to find the JSON
+  let cleaned = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 
   if (cleaned.startsWith('```')) {
     cleaned = cleaned
@@ -120,7 +239,13 @@ function extractJsonPayload(raw: string): string {
 }
 
 function normalizeParsedIntent(raw: any): ParsedIntent {
-  const rawIntent = (raw?.intent || raw?.action || 'GENERAL_CHAT').toUpperCase();
+  let rawIntent = (raw?.intent || raw?.action || 'GENERAL_CHAT').toUpperCase();
+  
+  // Handle common aliases
+  if (rawIntent === 'STATUS_REPORT' || rawIntent === 'CHART') {
+    rawIntent = 'DASHBOARD_CHART';
+  }
+
   const intent: ParsedIntent['intent'] = ALLOWED_INTENTS.has(rawIntent as any) ? (rawIntent as any) : 'GENERAL_CHAT';
   
   // Default to 1.0 if confidence is missing but intent is specific
