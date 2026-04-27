@@ -1,60 +1,106 @@
 # ChatOps Tracker
 
-ChatOps Tracker converts WhatsApp team messages into structured task operations with a hybrid parser:
+ChatOps Tracker is a system that converts WhatsApp team conversations into structured, actionable tasks.
 
-- Explicit commands (`!task`, `!done`, `!status`, etc.)
-- LLM parsing for natural-language updates
+While it looks like a task manager on the surface, the core idea is to explore how **agent-native systems** can be designed beyond traditional chatbots.
 
-The runtime follows an OpenClaw-inspired architecture: channel adapter, composable context assembly, task manager, scheduler, and dashboard sync.
+---
 
-## Version
+## 🚀 Why this project?
 
-Current version: `0.2.0`
+Most chatbots only respond.
 
-## What Changed in 0.2.0
+This system is built to **act** — by understanding context, managing state, and executing workflows.
 
-- Added provider-agnostic LLM parsing
-- Supports `openai`, `anthropic`, `gemini`, and `openai_compatible`
-- Added provider factory + HTTP adapters
-- Added parser output normalization to keep intent handling stable across providers
+It is inspired by agent-oriented architectures (like OpenClaw), where an agent is not just a prompt, but a system that:
+- maintains context
+- orchestrates tools
+- executes actions
 
-See [CHANGELOG.md](./CHANGELOG.md) for details.
+---
 
-## Quick Start
+## 🧠 Core Concepts
 
-1. Install dependencies
+### 1. Gateway-first architecture
+A **WhatsApp Adapter** acts as the entry point, decoupling messaging from core logic.
 
-```bash
-npm install
-```
+### 2. Context Assembly
+A **Context Assembler** reconstructs conversation history and resolves references like:
+> “it”, “that”, “this task”
 
-2. Configure `.env`
+This happens *before* the LLM is invoked.
 
-- Set `LLM_PROVIDER`
-- Set `LLM_MODEL`
-- Add the matching provider API key
-- Set `ALLOWED_GROUPS`
+### 3. Provider-agnostic LLM layer
+A **Provider Factory** supports:
+- OpenAI
+- Anthropic
+- Gemini
 
-3. Run in dev mode
+This avoids vendor lock-in and allows flexible routing.
 
-```bash
-npm run dev
-```
+### 4. Agentic Skills & Execution
+Instead of static responses:
+- **Skill Manager** handles task execution
+- **Cron Manager** supports recurring workflows (e.g., standups, reminders)
 
-4. Scan WhatsApp QR and send `!help` in your group.
+---
 
-## LLM Provider Configuration
+## ⚙️ Tech Stack
 
-Use one provider per runtime:
+- **Backend:** Node.js, TypeScript  
+- **Database:** SQLite (local-first approach)  
+- **LLMs:** OpenAI, Anthropic, Gemini  
+- **Realtime:** WebSockets (live dashboard updates)  
 
-- `LLM_PROVIDER=openai`
-- `LLM_PROVIDER=anthropic`
-- `LLM_PROVIDER=gemini`
-- `LLM_PROVIDER=openai_compatible`
+---
 
-For provider-specific env details, see [docs/MODEL_PROVIDERS.md](./docs/MODEL_PROVIDERS.md).
+## 🏗️ System Flow
 
-## Notes
+1. User sends message on WhatsApp  
+2. WhatsApp Adapter receives input  
+3. Context Assembler builds session state  
+4. LLM processes enriched context  
+5. Skill Manager executes actions  
+6. Results are stored + synced to dashboard  
 
-- OpenAI-compatible mode is useful for local/self-hosted gateways that implement the OpenAI chat completions API.
-- The parser still runs command-first for speed and cost efficiency; LLM parsing is used as fallback.
+---
+
+## 📌 Example Use Cases
+
+- Convert chat messages into tasks  
+- Assign and track team work from WhatsApp  
+- Schedule recurring updates (daily standups, reminders)  
+- Maintain conversational context across threads  
+
+---
+
+## 🧩 Key Idea
+
+This is not just a chatbot.
+
+It’s an attempt to build a **lightweight agent runtime**, where:
+- context is persistent  
+- tools are first-class  
+- execution is structured  
+
+---
+
+## 🔮 Future Improvements
+
+- Multi-agent coordination  
+- Better memory handling (long-term context)  
+- UI for workflow customization  
+- Plugin-based skill system  
+
+---
+
+## 🤝 Contributing
+
+Open to ideas, feedback, and improvements.  
+If you're exploring similar agent-based systems, feel free to connect or raise an issue.
+
+---
+
+## 📬 Notes
+
+This project is part of my exploration into **GenAI system design**, especially around moving from prompt-based systems to **agent-driven architectures**.
