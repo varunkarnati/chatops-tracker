@@ -85,6 +85,38 @@ It’s an attempt to build a **lightweight agent runtime**, where:
 
 ---
 
+## 🚀 Quick Start (How to Run)
+
+1. **Install Dependencies**
+   ```bash
+   npm install
+   ```
+
+2. **Environment Configuration**
+   Copy `.env.example` to `.env` (or create a `.env` file) and set up your LLM provider.
+   ```env
+   # Choose one: openai | anthropic | gemini | openai_compatible
+   LLM_PROVIDER=openai_compatible
+   LLM_MODEL=qwen/qwen3-32b
+   OPENAI_API_KEY=your_api_key_here
+   
+   # Optional: Restrict bot to specific WhatsApp groups
+   ALLOWED_GROUPS=
+   ```
+
+3. **Start the Development Server**
+   ```bash
+   npm run dev
+   ```
+
+4. **Connect WhatsApp**
+   When the server starts, a QR code will print in the terminal. Scan it with your WhatsApp mobile app (Linked Devices) to connect the bot.
+
+5. **Interact**
+   Send a message in any WhatsApp group the bot is in, such as *"Can you create a task to fix the login bug and assign it to @John?"*
+
+---
+
 ## 🔮 Future Improvements
 
 - Multi-agent coordination  
