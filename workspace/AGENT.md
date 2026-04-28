@@ -44,7 +44,7 @@ When User Session Context is available, resolve pronouns:
 - `DELETE_CRON`: Removing a scheduled reminder.
 - `ASSIGN_TASK`: Explicitly reassigning a task to someone.
 - `SET_DEADLINE`: Updating a task's due date.
-- `EXECUTE_CODE`: When the user asks to calculate something, write a script, fetch live data, or automate a technical task.
+- `EXECUTE_CODE`: When the user asks to calculate something, write a script, fetch live data, check if a service/website is down, or automate any technical task. The bot will run the code in a sandbox and return the result.
 - `GENERAL_CHAT`: Greetings, jokes, or conversation not related to tasks.
 
 ## Fuzzy ID Matching (CRITICAL)

@@ -278,12 +278,29 @@ export class TaskManager {
       if (task) {
         const updated = database.updateTaskStatus(task.displayId, projectId, newStatus, sender.id);
         if (updated) {
+          const emoji = { todo: '📋', in_progress: '🔄', testing: '🧪', done: '✅' };
           return {
-            message: `✅ *Task #${updated.displayId}* → *${newStatus.toUpperCase()}*\n📌 ${updated.title}`,
+            message: `${emoji[newStatus as keyof typeof emoji] || '📋'} *Task #${updated.displayId}* → *${newStatus.toUpperCase()}*\n📌 ${updated.title}`,
             task: updated,
           };
         }
       }
+    }
+
+    // Auto-guess: If no ID or title matched, check if the sender only has ONE open task
+    const userOpenTasks = database.getTasksByProject(projectId).filter(t => t.assignedTo === sender.id && t.status !== 'done');
+    if (userOpenTasks.length === 1) {
+      const task = userOpenTasks[0];
+      const updated = database.updateTaskStatus(task.displayId, projectId, newStatus, sender.id);
+      if (updated) {
+        const emoji = { todo: '📋', in_progress: '🔄', testing: '🧪', done: '✅' };
+        return {
+          message: `🤖 *Assumed Task*: Since you only have one open task, I updated it for you.\n${emoji[newStatus as keyof typeof emoji] || '📋'} *Task #${updated.displayId}* → *${newStatus.toUpperCase()}*\n📌 ${updated.title}`,
+          task: updated,
+        };
+      }
+    } else if (userOpenTasks.length > 1) {
+       return { message: `❓ You have ${userOpenTasks.length} open tasks. Please specify which one (e.g., \`#${userOpenTasks[0].displayId}\`).` };
     }
 
     return { message: `❓ Couldn't find a matching task to update. Try \`!done <task_id>\`` };
@@ -384,7 +401,7 @@ export class TaskManager {
 
   private assignTask(intent: ParsedIntent, projectId: string, sender: TeamMember, mentions: string[] = []): TaskResponse {
     if (!intent.task?.relatedTaskId) {
-      return { message: '❓ Usage: `!assign <task_id> @person`' };
+      return { message: '❓ I know you want to assign a task, but I could not figure out which one. Please reply with the task ID (e.g., #4).' };
     }
 
     // Try LLM-extracted phone, then WhatsApp mentions
@@ -399,8 +416,9 @@ export class TaskManager {
       }
     }
 
+    // If no assignee is explicitly mentioned, assume the sender is claiming it ("I'll take it")
     if (!assignee) {
-      return { message: '❓ Could not find that team member.' };
+      assignee = sender;
     }
 
     // Actually update the task assignment in the database

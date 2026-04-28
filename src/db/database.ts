@@ -6,14 +6,27 @@ import { mkdirSync } from 'fs';
 import { dirname } from 'path';
 
 // Ensure data directory exists
-mkdirSync(dirname(config.dbPath), { recursive: true });
+if (config.dbPath !== ':memory:') {
+  mkdirSync(dirname(config.dbPath), { recursive: true });
+}
 
-const db = new Database(config.dbPath);
+let db = new Database(config.dbPath);
+
+/**
+ * Switch to a clean database (e.g. :memory:) for testing.
+ */
+export function initTestDatabase(path: string = ':memory:') {
+  if (db) db.close();
+  db = new Database(path);
+  db.pragma('journal_mode = WAL');
+  db.pragma('foreign_keys = ON');
+  db.exec(SCHEMA);
+}
+
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
-// Initialize schema
-db.exec(`
+const SCHEMA = `
   CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -138,7 +151,10 @@ db.exec(`
   CREATE UNIQUE INDEX IF NOT EXISTS idx_cron_display_id ON cron_jobs(project_id, display_id);
   CREATE INDEX IF NOT EXISTS idx_group_messages_group ON group_messages(group_id, timestamp DESC);
   CREATE INDEX IF NOT EXISTS idx_group_messages_msg_id ON group_messages(message_id);
-`);
+`;
+
+// Run initial initialization
+db.exec(SCHEMA);
 
 // ============================================================
 // Row mappers: SQLite returns snake_case, our interfaces use camelCase
@@ -193,6 +209,10 @@ export const database = {
 
   getProjects(): Array<{ id: string; name: string; whatsapp_group_id: string }> {
     return db.prepare('SELECT id, name, whatsapp_group_id FROM projects ORDER BY created_at ASC').all() as any[];
+  },
+
+  getProjectByGroupId(groupId: string): { id: string; name: string } | undefined {
+    return db.prepare('SELECT id, name FROM projects WHERE whatsapp_group_id = ?').get(groupId) as any;
   },
 
   getAllProjectGroups(): Map<string, string> {

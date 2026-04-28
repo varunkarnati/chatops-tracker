@@ -95,6 +95,7 @@ RULES:
 7. For UPDATE_STATUS, always include "relatedTaskId" as a number.
 8. If the user refers to a task by name (e.g., "move the login task to testing") without the ID, YOU MUST FIND the task in the 'Current Board State' snapshot, extract its #ID, and output it as "relatedTaskId".
 9. For EXECUTE_CODE, the code snippet MUST be a valid JSON string. You MUST escape all newlines as \\n, double quotes as \\", and backslashes as \\\\.
+10. For UPDATE_STATUS, you MUST provide the "status" field in the task object (one of: "todo", "in_progress", "testing", "done"). Do not leave it empty.
 
 JSON schema:
 {
@@ -249,7 +250,7 @@ function getProvider(): LlmProviderClient {
   return provider;
 }
 
-function extractJsonPayload(raw: string): string {
+export function extractJsonPayload(raw: string): string {
   // Strip out any reasoning blocks before trying to find the JSON
   let cleaned = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 
@@ -269,7 +270,7 @@ function extractJsonPayload(raw: string): string {
   return cleaned;
 }
 
-function normalizeParsedIntent(raw: any): ParsedIntent {
+export function normalizeParsedIntent(raw: any): ParsedIntent {
   let rawIntent = (raw?.intent || raw?.action || 'GENERAL_CHAT').toUpperCase();
   
   // Handle common aliases

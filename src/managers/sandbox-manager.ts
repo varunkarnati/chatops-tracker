@@ -43,7 +43,7 @@ export class SandboxManager {
         // Run python script inside a disposable container.
         // Mount only the specific file as read-only.
         const mountPath = isWindows ? scriptPath.replace(/\\/g, '/') : scriptPath;
-        const cmd = `docker run --rm --memory="128m" --cpus="0.5" --network none -v "${mountPath}:/app/script.py:ro" python:3.10-alpine python /app/script.py`;
+        const cmd = `docker run --rm --memory="128m" --cpus="0.5" -v "${mountPath}:/app/script.py:ro" python:3.10-alpine python /app/script.py`;
         
         const { stdout, stderr } = await execAsync(cmd, { timeout: 10000 });
         result = stdout + (stderr ? `\n[Errors]:\n${stderr}` : '');
@@ -59,7 +59,7 @@ export class SandboxManager {
       
       try {
         const mountPath = isWindows ? scriptPath.replace(/\\/g, '/') : scriptPath;
-        const cmd = `docker run --rm --memory="128m" --cpus="0.5" --network none -v "${mountPath}:/app/script.js:ro" node:18-alpine node /app/script.js`;
+        const cmd = `docker run --rm --memory="128m" --cpus="0.5" -v "${mountPath}:/app/script.js:ro" node:18-alpine node /app/script.js`;
         
         const { stdout, stderr } = await execAsync(cmd, { timeout: 10000 });
         result = stdout + (stderr ? `\n[Errors]:\n${stderr}` : '');
@@ -75,7 +75,7 @@ export class SandboxManager {
       
       try {
         const mountPath = isWindows ? scriptPath.replace(/\\/g, '/') : scriptPath;
-        const cmd = `docker run --rm --memory="128m" --cpus="0.5" --network none -v "${mountPath}:/app/script.sh:ro" alpine:latest sh /app/script.sh`;
+        const cmd = `docker run --rm --memory="128m" --cpus="0.5" -v "${mountPath}:/app/script.sh:ro" alpine:latest sh /app/script.sh`;
         
         const { stdout, stderr } = await execAsync(cmd, { timeout: 10000 });
         result = stdout + (stderr ? `\n[Errors]:\n${stderr}` : '');
